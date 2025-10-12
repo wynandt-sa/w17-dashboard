@@ -1,0 +1,47 @@
+<?php
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+
+if (is_logged_in()) {
+    header('Location: ' . (BASE_URL ?: '') . '/dashboard.php');
+    exit;
+}
+
+$error = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $username = trim($_POST['username'] ?? '');
+    $password = $_POST['password'] ?? '';
+
+    if ($username && $password) {
+        $stmt = db()->prepare('SELECT * FROM users WHERE username = :u AND active = 1 LIMIT 1');
+        $stmt->execute([':u' => $username]);
+        $row = $stmt->fetch();
+        if ($row && password_verify($password, $row['password'])) {
+            $_SESSION['user'] = $row;
+            header('Location: ' . (BASE_URL ?: '') . '/dashboard.php');
+            exit;
+        }
+    }
+    $error = 'Invalid credentials';
+}
+
+include __DIR__ . '/partials/header.php';
+?>
+<div class="card" style="max-width:480px;margin:4rem auto;">
+  <div class="card-h"><h3>Login to Dashboard</h3></div>
+  <div class="card-b">
+    <?php if($error): ?>
+      <div class="badge badge-danger" style="display:block;margin-bottom:1rem;"><?= e($error) ?></div>
+    <?php else: ?>
+      <div class="badge badge-primary" style="display:block;margin-bottom:1rem;">Workshop17 Ticketing System</div>
+    <?php endif; ?>
+    <form method="post" class="grid">
+      <input type="text" class="input" name="username" placeholder="Username" required>
+      <input type="password" class="input" name="password" placeholder="Password" required>
+      <button class="btn btn-primary" type="submit">Log In</button>
+    </form>
+    <div style="margin-top:1rem;font-size:.9rem;color:#555">
+    </div>
+  </div>
+</div>
+<?php include __DIR__ . '/partials/footer.php'; ?>

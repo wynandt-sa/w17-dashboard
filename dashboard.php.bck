@@ -1,0 +1,518 @@
+<?php
+require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/auth.php';
+require_login();
+
+/* Prevent stale caching so celebrations update each day */
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+
+if (!function_exists('e')) {
+  function e($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+}
+function log_err($ex){
+  try { @file_put_contents('/tmp/ticketing_error.log', "[".date('c')."] ".$ex->getMessage()."\n", FILE_APPEND); } catch(Throwable $t) {}
+}
+
+$pdo = db();
+$pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+/* ---------- tiny schema helpers ---------- */
+function table_exists(PDO $pdo, $table){
+  try {
+    $stmt = $pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1");
+    $stmt->execute([$table]);
+    return (bool)$stmt->fetchColumn();
+  } catch (Throwable $e) { log_err($e); return false; }
+}
+function has_col(PDO $pdo, $table, $col){
+  try {
+    $stmt = $pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1");
+    $stmt->execute([$table, $col]);
+    return (bool)$stmt->fetchColumn();
+  } catch (Throwable $e) { log_err($e); return false; }
+}
+function col_exists(PDO $pdo, $table, $col){ return has_col($pdo,$table,$col); }
+
+/* ---------- Queue visibility (strict) ---------- */
+$me = user();
+$is_admin = ($me['role'] ?? '') === 'admin';
+
+/* Ensure access table exists (used by other pages as well) */
+try {
+  $pdo->exec("
+    CREATE TABLE IF NOT EXISTS user_queue_access (
+      user_id INT NOT NULL,
+      queue ENUM('Workshop17','HR','Finance') NOT NULL,
+      PRIMARY KEY (user_id, queue),
+      CONSTRAINT fk_uqa_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  ");
+} catch (Throwable $e) { log_err($e); }
+
+$params = []; $whereQueues = ''; $myQueues = [];
+if (!$is_admin) {
+  try {
+    $uq = $pdo->prepare("SELECT queue FROM user_queue_access WHERE user_id=?");
+    $uq->execute([$me['id']]);
+    $myQueues = $uq->fetchAll(PDO::FETCH_COLUMN);
+  } catch (Throwable $e) { log_err($e); $myQueues = []; }
+
+  if (!$myQueues) {
+    $whereQueues = "WHERE 1=0"; // no queues => nothing visible
+  } else {
+    $in = implode(',', array_fill(0,count($myQueues),'?'));
+    $whereQueues = "WHERE t.queue IN ($in)";
+    $params = array_values($myQueues);
+  }
+}
+
+/* ---------- KPIs (queue-filtered for non-admins) ---------- */
+try {
+  $sqlOpen = "SELECT COUNT(*) c FROM tickets t $whereQueues" . ($whereQueues ? " AND" : " WHERE") . " t.status <> 'Closed'";
+  $st = $pdo->prepare($sqlOpen); $st->execute($params);
+  $openCount = (int)($st->fetchColumn() ?? 0);
+} catch(Throwable $e){ $openCount=0; log_err($e); }
+
+try {
+  $dateCol = col_exists($pdo,'tickets','updated_at') ? 't.updated_at' : 't.created_at';
+  $sqlRes = "SELECT COUNT(*) c FROM tickets t $whereQueues" . ($whereQueues ? " AND" : " WHERE") . " t.status='Resolved' AND DATE($dateCol)=CURDATE()";
+  $st = $pdo->prepare($sqlRes); $st->execute($params);
+  $resolvedCount = (int)($st->fetchColumn() ?? 0);
+} catch(Throwable $e){ $resolvedCount=0; log_err($e); }
+
+try { $activeTasks = (int)($pdo->query("SELECT COUNT(*) c FROM tasks WHERE status <> 'completed'")->fetch()['c'] ?? 0); }
+catch(Throwable $e){ $activeTasks=0; log_err($e); }
+
+/* Admin-only meta */
+try { $totalUsers = $is_admin ? (int)($pdo->query("SELECT COUNT(*) c FROM users")->fetch()['c'] ?? 0) : null; }
+catch(Throwable $e){ $totalUsers=null; log_err($e); }
+
+/* ---------- Recent tickets: only OPEN & assigned to ME (and in my queues) ---------- */
+try {
+  $sqlRT = "SELECT t.ticket_number, t.subject, t.status, t.priority, t.created_at
+            FROM tickets t
+            $whereQueues" . ($whereQueues ? " AND" : " WHERE") . " t.status <> 'Closed' AND t.agent_id = ?
+            ORDER BY t.id DESC
+            LIMIT 8";
+  $st = $pdo->prepare($sqlRT);
+  $st->execute([...$params, (int)$me['id']]);
+  $recentTickets = $st->fetchAll(PDO::FETCH_ASSOC);
+} catch (Throwable $e) { $recentTickets = []; log_err($e); }
+
+/* ---------- Celebrations ---------- */
+$todayUsersBirthdays = $todayUsersAnniv = $todayLocationBirthdays = [];
+$upcomingUsersBirthdays = $upcomingUsersAnniv = $upcomingLocationBirthdays = [];
+
+try {
+  $userDisplayExpr = "CONCAT_WS(' ', first_name, last_name)";
+  $mdayList = [];
+  for ($i=1; $i<=5; $i++) $mdayList[] = date('m-d', strtotime("+$i day"));
+  $mdayQs = $mdayList ? implode(',', array_fill(0, count($mdayList), '?')) : "'--'";
+
+  // Users: birthdays
+  $todayUsersBirthdays = $pdo->query("
+    SELECT id, $userDisplayExpr AS display_name, date_of_birth
+    FROM users
+    WHERE date_of_birth IS NOT NULL
+      AND DATE_FORMAT(date_of_birth,'%m-%d') = DATE_FORMAT(CURDATE(),'%m-%d')
+    ORDER BY display_name
+  ")->fetchAll(PDO::FETCH_ASSOC);
+
+  $st = $pdo->prepare("
+    SELECT id, $userDisplayExpr AS display_name, date_of_birth
+    FROM users
+    WHERE date_of_birth IS NOT NULL
+      AND DATE_FORMAT(date_of_birth,'%m-%d') IN ($mdayQs)
+    ORDER BY DATE_FORMAT(date_of_birth,'%m-%d'), display_name
+  ");
+  $st->execute($mdayList);
+  $upcomingUsersBirthdays = $st->fetchAll(PDO::FETCH_ASSOC);
+
+  // Users: anniversaries
+  $todayUsersAnniv = $pdo->query("
+    SELECT id, $userDisplayExpr AS display_name, work_anniversary,
+           TIMESTAMPDIFF(YEAR, work_anniversary, CURDATE()) AS years_now
+    FROM users
+    WHERE work_anniversary IS NOT NULL
+      AND DATE_FORMAT(work_anniversary,'%m-%d') = DATE_FORMAT(CURDATE(),'%m-%d')
+    ORDER BY display_name
+  ")->fetchAll(PDO::FETCH_ASSOC);
+
+  $st = $pdo->prepare("
+    SELECT id, $userDisplayExpr AS display_name, work_anniversary,
+           YEAR(work_anniversary) AS start_year,
+           DATE_FORMAT(work_anniversary,'%m-%d') AS md
+    FROM users
+    WHERE work_anniversary IS NOT NULL
+      AND DATE_FORMAT(work_anniversary,'%m-%d') IN ($mdayQs)
+    ORDER BY md, display_name
+  ");
+  $st->execute($mdayList);
+  $upcomingUsersAnniv = $st->fetchAll(PDO::FETCH_ASSOC);
+  $cy = (int)date('Y');
+  foreach ($upcomingUsersAnniv as &$r) { $r['years_next'] = max(1, $cy - (int)$r['start_year']); }
+  unset($r);
+
+  // Locations
+  if (table_exists($pdo, 'locations')) {
+    $locCol  = has_col($pdo, 'locations', 'birthday') ? 'birthday' : (has_col($pdo, 'locations', 'birthdate') ? 'birthdate' : null);
+    $locName = has_col($pdo, 'locations', 'name') ? 'name' : (has_col($pdo, 'locations', 'location_name') ? 'location_name' : null);
+
+    if ($locCol && $locName) {
+      $todayLocationBirthdays = $pdo->query("
+        SELECT id, $locName AS loc_name, $locCol AS bday,
+               TIMESTAMPDIFF(YEAR, $locCol, CURDATE()) AS years_now
+        FROM locations
+        WHERE $locCol IS NOT NULL
+          AND DATE_FORMAT($locCol,'%m-%d') = DATE_FORMAT(CURDATE(),'%m-%d')
+        ORDER BY loc_name
+      ")->fetchAll(PDO::FETCH_ASSOC);
+
+      $st = $pdo->prepare("
+        SELECT id, $locName AS loc_name, $locCol AS bday,
+               YEAR($locCol) AS start_year,
+               DATE_FORMAT($locCol,'%m-%d') AS md
+        FROM locations
+        WHERE $locCol IS NOT NULL
+          AND DATE_FORMAT($locCol,'%m-%d') IN ($mdayQs)
+        ORDER BY DATE_FORMAT($locCol,'%m-%d'), loc_name
+      ");
+      $st->execute($mdayList);
+      $upcomingLocationBirthdays = $st->fetchAll(PDO::FETCH_ASSOC);
+      foreach ($upcomingLocationBirthdays as &$L) {
+        $L['years_next'] = max(1, $cy - (int)$L['start_year']);
+      }
+      unset($L);
+    }
+  }
+
+} catch (Throwable $e) {
+  log_err($e);
+  $todayUsersBirthdays = $todayUsersAnniv = $todayLocationBirthdays = [];
+  $upcomingUsersBirthdays = $upcomingUsersAnniv = $upcomingLocationBirthdays = [];
+}
+
+$hasToday = (count($todayUsersBirthdays) + count($todayUsersAnniv) + count($todayLocationBirthdays)) > 0;
+$hasUpcoming = (count($upcomingUsersBirthdays) + count($upcomingUsersAnniv) + count($upcomingLocationBirthdays)) > 0;
+$hasAnyCelebrations = $hasToday || $hasUpcoming;
+
+/* ---------- Monitoring badges for the user's location ---------- */
+$myLocation = null;            // ['id'=>..,'code'=>..,'name'=>..]
+$myBadges   = [];              // list of monitoring_badges rows (active only)
+
+try {
+  if (table_exists($pdo,'locations') && has_col($pdo,'users','location_id')) {
+    $st = $pdo->prepare("SELECT l.id, l.code, l.name
+                         FROM users u
+                         JOIN locations l ON l.id = u.location_id
+                         WHERE u.id = ? LIMIT 1");
+    $st->execute([(int)$me['id']]);
+    $myLocation = $st->fetch(PDO::FETCH_ASSOC) ?: null;
+
+    if ($myLocation && table_exists($pdo,'monitoring_badges') && table_exists($pdo,'location_badges')) {
+      $q = $pdo->prepare("
+        SELECT b.*
+        FROM monitoring_badges b
+        JOIN location_badges lb ON lb.badge_id = b.id
+        WHERE lb.location_id = ? AND b.active = 1
+        ORDER BY b.name
+      ");
+      $q->execute([(int)$myLocation['id']]);
+      $myBadges = $q->fetchAll(PDO::FETCH_ASSOC);
+    }
+  }
+} catch (Throwable $e) { log_err($e); }
+
+include __DIR__ . '/partials/header.php';
+?>
+
+<!-- ======= Celebrations FIRST (top of dashboard) — not collapsible ======= -->
+<?php if ($hasAnyCelebrations): ?>
+  <div class="cele-wrap">
+    <?php if ($hasToday): ?>
+      <div class="cele-banner card">
+        <div class="card-h"><h3>🎉 Today's Celebrations</h3></div>
+        <div class="card-b">
+          <div class="cele-list">
+            <?php foreach ($todayUsersBirthdays as $p): ?>
+              <div class="cele-card">
+                <div class="cele-emoji">🎂</div>
+                <div>
+                  <div class="cele-name"><?= e($p['display_name']) ?></div>
+                  <div class="cele-sub">Happy Birthday! 🥳</div>
+                </div>
+                <button class="cele-btn" type="button">Celebrate</button>
+              </div>
+            <?php endforeach; ?>
+
+            <?php foreach ($todayUsersAnniv as $p): ?>
+              <div class="cele-card">
+                <div class="cele-emoji">🏆</div>
+                <div>
+                  <div class="cele-name"><?= e($p['display_name']) ?></div>
+                  <div class="cele-sub"><?= (int)max(0,(int)$p['years_now']) ?> <?= ((int)$p['years_now']===1?'Year':'Years') ?> at Workshop17!</div>
+                </div>
+                <button class="cele-btn" type="button">Celebrate</button>
+              </div>
+            <?php endforeach; ?>
+
+            <?php foreach ($todayLocationBirthdays as $l): ?>
+              <div class="cele-card">
+                <div class="cele-emoji">📍</div>
+                <div>
+                  <div class="cele-name"><?= e($l['loc_name']) ?></div>
+                  <div class="cele-sub">Location Birthday — <?= (int)$l['years_now'] ?> <?= ((int)$l['years_now']===1 ? 'Year' : 'Years') ?> 🎉</div>
+                </div>
+                <button class="cele-btn" type="button">Celebrate</button>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <?php if ($hasUpcoming): ?>
+      <div class="card">
+        <div class="card-h"><h3>🗓️ Upcoming (next 5 days)</h3></div>
+        <div class="card-b">
+          <div class="cele-list">
+            <?php foreach ($upcomingUsersBirthdays as $p): ?>
+              <div class="cele-card cele-muted">
+                <div class="cele-emoji">🎂</div>
+                <div>
+                  <div class="cele-name"><?= e($p['display_name']) ?></div>
+                  <div class="cele-sub">Birthday on <?= e(date('D, d M', strtotime($p['date_of_birth']))) ?></div>
+                </div>
+              </div>
+            <?php endforeach; ?>
+
+            <?php foreach ($upcomingUsersAnniv as $p): ?>
+              <div class="cele-card cele-muted">
+                <div class="cele-emoji">🏆</div>
+                <div>
+                  <div class="cele-name"><?= e($p['display_name']) ?></div>
+                  <div class="cele-sub"><?= (int)$p['years_next'] ?> <?= ((int)$p['years_next']===1?'Year':'Years') ?> on <?= e(date('D, d M', strtotime(date('Y').'-'.$p['md']))) ?></div>
+                </div>
+              </div>
+            <?php endforeach; ?>
+
+            <?php foreach ($upcomingLocationBirthdays as $l): ?>
+              <div class="cele-card cele-muted">
+                <div class="cele-emoji">📍</div>
+                <div>
+                  <div class="cele-name"><?= e($l['loc_name']) ?></div>
+                  <div class="cele-sub">Location Birthday — <?= (int)$l['years_next'] ?> <?= ((int)$l['years_next']===1?'Year':'Years') ?> on <?= e(date('D, d M', strtotime(date('Y').'-'.$l['md']))) ?></div>
+                </div>
+              </div>
+            <?php endforeach; ?>
+          </div>
+        </div>
+      </div>
+    <?php endif; ?>
+  </div>
+<?php endif; ?>
+
+<!-- ======= KPIs (compact essentials) ======= -->
+<div class="card">
+  <div class="card-h">
+    <h3>Dashboard</h3>
+    <?php if ($is_admin && $totalUsers !== null): ?>
+      <div class="badge badge-primary">Users: <?= (int)$totalUsers ?></div>
+    <?php endif; ?>
+  </div>
+  <div class="card-b">
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-label">Open Tickets</div>
+        <div class="kpi-value"><?= (int)$openCount ?></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Resolved Today</div>
+        <div class="kpi-value"><?= (int)$resolvedCount ?></div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Active Tasks</div>
+        <div class="kpi-value"><?= (int)$activeTasks ?></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ======= Recent Tickets (assigned to me) ======= -->
+<div class="card">
+  <div class="card-h"><h3>My Open Tickets</h3></div>
+  <div class="card-b">
+    <?php if (empty($recentTickets)): ?>
+      <p>No open tickets assigned to you.</p>
+    <?php else: ?>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>Ticket #</th><th>Subject</th><th>Status</th><th>Priority</th><th class="fit">Created</th></tr></thead>
+          <tbody>
+            <?php foreach($recentTickets as $t): ?>
+              <tr>
+                <td><?= e($t['ticket_number']) ?></td>
+                <td><?= e($t['subject']) ?></td>
+                <td><span class="badge badge-primary"><?= e($t['status']) ?></span></td>
+                <td><?= e($t['priority']) ?></td>
+                <td class="fit"><?= e(date('Y-m-d', strtotime($t['created_at']))) ?></td>
+              </tr>
+            <?php endforeach; ?>
+          </tbody>
+        </table>
+      </div>
+    <?php endif; ?>
+  </div>
+</div>
+
+<!-- ======= Apps (quick links) ======= -->
+<div class="card">
+  <div class="card-h"><h3>Apps</h3></div>
+  <div class="card-b">
+    <div class="apps-grid">
+      <a class="app-card" href="https://my.workshop17.com" target="_blank" rel="noopener">
+        <div class="app-title">My Workshop17</div>
+        <div class="app-sub">my.workshop17.com</div>
+      </a>
+      <a class="app-card" href="https://print.workshop17.com" target="_blank" rel="noopener">
+        <div class="app-title">Papercut</div>
+        <div class="app-sub">print.workshop17.com</div>
+      </a>
+      <a class="app-card" href="https://crm.workshop17.co.za" target="_blank" rel="noopener">
+        <div class="app-title">Workshop17 CRM</div>
+        <div class="app-sub">crm.workshop17.co.za</div>
+      </a>
+      <a class="app-card" href="https://workshop17.com" target="_blank" rel="noopener">
+        <div class="app-title">Workshop17 Website</div>
+        <div class="app-sub">workshop17.com</div>
+      </a>
+      <a class="app-card" href="https://radius.workshop17.com:2443" target="_blank" rel="noopener">
+        <div class="app-title">Radius Server</div>
+        <div class="app-sub">radius.workshop17.com</div>
+      </a>
+    </div>
+  </div>
+</div>
+
+<!-- ======= Monitoring (badges for my location) ======= -->
+<div class="card">
+  <div class="card-h">
+    <h3>Monitoring<?= $myLocation ? ' — '.e($myLocation['code']) : '' ?></h3>
+  </div>
+  <div class="card-b">
+    <?php if (!$myLocation): ?>
+      <p>Your profile doesn’t have a location yet. Ask an admin to set it to see monitoring here.</p>
+    <?php elseif (!$myBadges): ?>
+      <p>No monitoring badges configured for your location.</p>
+    <?php else: ?>
+      <div class="mon-grid">
+        <?php foreach($myBadges as $b): ?>
+          <div class="mon-card">
+            <div class="mon-top">
+              <div class="mon-title"><?= e($b['name']) ?></div>
+              <div class="mon-pill" data-url="<?= e($b['url']) ?>">—</div>
+            </div>
+            <?php if(!empty($b['description'])): ?>
+              <div class="mon-desc"><?= e($b['description']) ?></div>
+            <?php endif; ?>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endif; ?>
+  </div>
+</div>
+
+<style>
+/* Apps grid */
+.apps-grid{
+  display:grid;
+  gap: .75rem;
+  grid-template-columns: repeat(5, minmax(0,1fr));
+}
+@media (max-width:1100px){ .apps-grid{ grid-template-columns: repeat(3, minmax(0,1fr)); } }
+@media (max-width:700px){  .apps-grid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
+@media (max-width:480px){  .apps-grid{ grid-template-columns: 1fr; } }
+
+.app-card{
+  display:flex; flex-direction:column; gap:.15rem;
+  background:#fff; border:1px solid var(--gray-200); border-radius:12px;
+  box-shadow:var(--shadow); padding:.9rem 1rem; text-decoration:none; color:inherit;
+}
+.app-card:hover{ background:#f9fafb; }
+.app-title{ font-weight:800; color:var(--dark); }
+.app-sub{ color:var(--muted); font-size:.92rem; }
+
+/* Monitoring grid */
+.mon-grid{
+  display:grid; gap:.75rem;
+  grid-template-columns: repeat(3, minmax(0,1fr));
+}
+@media (max-width:1100px){ .mon-grid{ grid-template-columns: repeat(2, minmax(0,1fr)); } }
+@media (max-width:640px){  .mon-grid{ grid-template-columns: 1fr; } }
+
+.mon-card{
+  background:#fff; border:1px solid var(--gray-200); border-radius:12px;
+  box-shadow:var(--shadow); padding:1rem; display:flex; flex-direction:column; gap:.5rem;
+}
+.mon-top{ display:flex; align-items:center; justify-content:space-between; gap:.75rem; }
+.mon-title{ font-weight:800; color:var(--dark); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mon-desc{ color:var(--muted); font-size:.92rem; }
+/* Styled value pill (matches site style) */
+.mon-pill{
+  display:inline-flex; align-items:center; justify-content:center;
+  padding:.35rem .6rem; border-radius:10px; font-weight:800;
+  background:rgba(136,194,143,.18); color:#285d33; border:1px solid #cae7cd;
+  min-width:64px;
+}
+</style>
+
+<script>
+/* lightweight confetti burst when clicking any "Celebrate" button */
+(function(){
+  function rand(min, max){ return Math.random()*(max-min)+min; }
+  function launchConfetti(burst=220){
+    const colors = ['#ffffff','#FFCDD2','#F8BBD0','#BBDEFB','#B2EBF2','#C8E6C9','#FFF9C4','#FFE0B2'];
+    const bodyW = document.documentElement.clientWidth;
+    for (let i=0;i<burst;i++){
+      const p = document.createElement('div');
+      p.style.position='fixed';
+      p.style.top='-10px';
+      p.style.left= (Math.random()*bodyW)+'px';
+      p.style.width = (Math.random()*6+6)+'px';
+      p.style.height= (Math.random()*8+10)+'px';
+      p.style.background = colors[Math.floor(Math.random()*colors.length)];
+      p.style.opacity='.95';
+      p.style.animation='fall '+(Math.random()*1.2+1.2)+'s linear forwards';
+      p.style.zIndex='80';
+      document.body.appendChild(p);
+      setTimeout(()=>p.remove(), 3000);
+    }
+  }
+  document.addEventListener('click', function(ev){
+    const btn = ev.target.closest('.cele-btn');
+    if (!btn) return;
+    launchConfetti(240);
+  }, {passive:true});
+})();
+
+/* Fetch badge value text from URL and render into .mon-pill */
+(function(){
+  async function fetchValue(url){
+    try{
+      const res = await fetch(url, { credentials:'omit', cache:'no-store' });
+      const txt = await res.text();
+      // Try to extract a percentage like "99.9%" first, otherwise a number
+      const m = txt.match(/(\d{1,3}(?:\.\d+)?%)/) || txt.match(/(\d+(?:\.\d+)?)/);
+      return m ? m[1] : '—';
+    }catch(e){ return '—'; }
+  }
+  document.querySelectorAll('.mon-pill[data-url]').forEach(async el=>{
+    const url = el.getAttribute('data-url');
+    const val = await fetchValue(url);
+    el.textContent = val;
+  });
+})();
+</script>
+
+<?php include __DIR__ . '/partials/footer.php'; ?>
