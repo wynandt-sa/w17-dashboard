@@ -57,6 +57,19 @@ if (!col_exists($pdo,'tickets','agent_id'))    $pdo->exec("ALTER TABLE tickets A
 if (!col_exists($pdo,'tickets','location_id')) $pdo->exec("ALTER TABLE tickets ADD COLUMN location_id INT NULL");
 if (!col_exists($pdo,'tickets','queue'))       $pdo->exec("ALTER TABLE tickets ADD COLUMN queue ENUM('Workshop17','HR','Finance') NULL DEFAULT 'Workshop17'");
 
+/* NEW: CC and Follower Schema */
+if (!col_exists($pdo,'tickets','cc_emails')) $pdo->exec("ALTER TABLE tickets ADD COLUMN cc_emails TEXT NULL");
+
+$pdo->exec("
+CREATE TABLE IF NOT EXISTS ticket_followers (
+  ticket_id INT NOT NULL,
+  user_id INT NOT NULL,
+  PRIMARY KEY (ticket_id, user_id),
+  CONSTRAINT fk_tf_ticket FOREIGN KEY (ticket_id) REFERENCES tickets(id) ON DELETE CASCADE,
+  CONSTRAINT fk_tf_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+");
+
 /* Related To taxonomy (tiered) */
 $pdo->exec("
 CREATE TABLE IF NOT EXISTS related_to_options (
@@ -216,7 +229,7 @@ function related_options_kv(PDO $pdo): array {
   return $out;
 }
 
-/* ---------- Zulip helper ---------- */
+/* ---------- Zulip helper (kept for SLA in tickets_service) ---------- */
 function zulip_send_pm(string $toEmail, string $content): bool {
   if (!defined('ZULIP_SITE') || !defined('ZULIP_BOT_EMAIL') || !defined('ZULIP_BOT_APIKEY') || !ZULIP_SITE || !ZULIP_BOT_EMAIL || !ZULIP_BOT_APIKEY) return false;
   $payload = [
@@ -238,8 +251,17 @@ function zulip_send_pm(string $toEmail, string $content): bool {
   return ($http >= 200 && $http < 300);
 }
 
+// Stubb for mail sending, relies on logic in tickets_service.php
+if (!function_exists('send_mail')) {
+    function send_mail(string $to, string $subject, string $body_html, ?string $from_email = null): bool {
+        // Relies on tickets_service.php stub being available for internal calls
+        error_log("MAIL_SENT_TICKET_INTERNAL: To: $to, From: $from_email, Subject: $subject");
+        return true;
+    }
+}
+
+
 /* ---------------- Run housekeeping now ---------------- */
-// This function is defined in tickets_service.php
 run_ticket_housekeeping($pdo); 
 
 /* ---------------- Queue access for current user ---------------- */
@@ -293,6 +315,23 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     }
     header('Location: tickets.php#manage-related'); exit;
   }
+  
+  /* NEW: Follow/Unfollow */
+  if (isset($_POST['toggle_follow'])) {
+    csrf_check();
+    $id = (int)($_POST['id'] ?? 0);
+    $is_following = (int)($_POST['is_following'] ?? 0);
+    if ($id <= 0) { header('Location: tickets.php?msg=invalid'); exit; }
+    
+    if ($is_following) {
+        $pdo->prepare("DELETE FROM ticket_followers WHERE ticket_id=? AND user_id=?")->execute([$id, $me['id']]);
+        header('Location: tickets.php?msg=unfollowed#t'.$id); exit;
+    } else {
+        $pdo->prepare("INSERT IGNORE INTO ticket_followers (ticket_id, user_id) VALUES (?,?)")->execute([$id, $me['id']]);
+        header('Location: tickets.php?msg=followed#t'.$id); exit;
+    }
+  }
+
 
   /* Create */
   if (isset($_POST['create'])) {
@@ -306,6 +345,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $location_id     = (int)($_POST['location_id'] ?? 0) ?: null;
     $queue           = $_POST['queue'] ?? null;
     $related_to_id   = (int)($_POST['related_to_id'] ?? 0) ?: null;
+    $cc_emails       = trim($_POST['cc_emails'] ?? '') ?: null; // NEW: CC field
     $pending_until   = null;
 
     if ($status === 'Pending') {
@@ -333,12 +373,12 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     if ($agent_id && $status !== 'Open') { $status = 'Open'; }
     $sla_started_at = ($status === 'Open') ? date('Y-m-d H:i:s') : null;
 
-    $ins = $pdo->prepare("INSERT INTO tickets (ticket_number,subject,requester_email,priority,status,description,created_by,agent_id,location_id,queue,related_to_id,pending_until,sla_started_at)
-                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    $ins = $pdo->prepare("INSERT INTO tickets (ticket_number,subject,requester_email,priority,status,description,created_by,agent_id,location_id,queue,related_to_id,pending_until,sla_started_at,cc_emails)
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     for ($i=0; $i<3; $i++) {
       try {
         $tn = next_ticket_number($pdo);
-        $ins->execute([$tn,$subject,$requester_email,$priority,$status,$description,$created_by,$agent_id,$location_id,$queue,$related_to_id,$pending_until,$sla_started_at]);
+        $ins->execute([$tn,$subject,$requester_email,$priority,$status,$description,$created_by,$agent_id,$location_id,$queue,$related_to_id,$pending_until,$sla_started_at,$cc_emails]);
         $tid = (int)$pdo->lastInsertId();
 
         // attachments on creation
@@ -355,23 +395,15 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
           'agent_id'=>$agent_id,'agent_name'=>user_name($pdo,$agent_id),
           'requester_email'=>$requester_email,'priority'=>$priority,'status'=>$status,
           'related_to_id'=>$related_to_id,'related_to'=> $related_to_id? related_path($pdo,$related_to_id):null,
-          'pending_until'=>$pending_until
+          'pending_until'=>$pending_until,
+          'cc_emails'=>$cc_emails
         ]);
-        if ($agent_id) {
-          add_log($pdo,$tid,$me['id'],'assign',[
-            'from_id'=>null,'from_name'=>null,'to_id'=>$agent_id,'to_name'=>user_name($pdo,$agent_id)
-          ]);
-          // notify assigned agent on Zulip
-          $agentEmail = $pdo->prepare("SELECT email FROM users WHERE id=?");
-          $agentEmail->execute([$agent_id]);
-          if ($email = $agentEmail->fetchColumn()) {
-            $link = (defined('APP_BASE_URL')? rtrim(APP_BASE_URL,'/') : '').'/tickets.php#t'.$tid;
-            $msg  = "You’ve been assigned ticket **{$tn}** — *".($subject ?: 'Ticket')."*.\n".
-                    "Queue: `{$queue}`  |  Priority: `{$priority}`  |  Status: `{$status}`\n".
-                    ($link ? "[Open in Dashboard Ticketing]($link)" : "");
-            @zulip_send_pm($email, $msg);
-          }
-        }
+        
+        // Reload ticket data to pass to notifier
+        $updated_row = $pdo->prepare("SELECT * FROM tickets WHERE id=?"); $updated_row->execute([$tid]); $tmeta = $updated_row->fetch(PDO::FETCH_ASSOC) ?: [];
+        
+        // Notify all recipients (excluding the current user/creator who knows they created it)
+        notify_ticket_recipients($pdo, $tid, 'new', $tmeta, "New ticket created by {$me['first_name']} {$me['last_name']}.", [$me['email'] ?? '']);
 
         header('Location: tickets.php?msg=created'); exit;
       } catch (Throwable $e) { if (stripos($e->getMessage(),'duplicate')===false) throw $e; }
@@ -388,6 +420,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     $agent_id        = (int)($_POST['agent_id'] ?? 0) ?: null;
     $queue           = $_POST['queue'] ?? null;
     $related_to_id   = (int)($_POST['related_to_id'] ?? 0) ?: null;
+    $cc_emails       = trim($_POST['cc_emails'] ?? '') ?: null; // NEW: CC field
     $pending_until   = null;
 
     if ($status === 'Pending') {
@@ -402,7 +435,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     if (!in_array($status,$STATUS_VALUES,true))     $status=$STATUS_DEFAULT;
 
     // Load current values for diff (+ SLA fields)
-    $old = $pdo->prepare("SELECT agent_id, status, priority, queue, requester_email, related_to_id, pending_until, sla_started_at, sla_paused_started_at, sla_paused_seconds FROM tickets WHERE id=?");
+    $old = $pdo->prepare("SELECT agent_id, status, priority, queue, requester_email, related_to_id, pending_until, sla_started_at, sla_paused_started_at, sla_paused_seconds, cc_emails, subject, ticket_number FROM tickets WHERE id=?");
     $old->execute([$id]);
     $before = $old->fetch(PDO::FETCH_ASSOC);
 
@@ -439,15 +472,14 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       $sla_sets[] = "sla_started_at=?"; $sla_args[]=$now;
     }
 
-    $sql="UPDATE tickets SET priority=?, status=?, agent_id=?, related_to_id=?, pending_until=?";
-    $args=[$priority,$status,$agent_id,$related_to_id,$status==='Pending'?$pending_until:null];
+    $sql="UPDATE tickets SET priority=?, status=?, agent_id=?, related_to_id=?, pending_until=?, cc_emails=?";
+    $args=[$priority,$status,$agent_id,$related_to_id,$status==='Pending'?$pending_until:null,$cc_emails];
     if ($queue!==null){ $sql.=", queue=?"; $args[]=$queue; }
     if ($sla_sets){ $sql.=", ".implode(", ", $sla_sets); $args=array_merge($args,$sla_args); }
     $sql.=" WHERE id=?"; $args[]=$id;
     $pdo->prepare($sql)->execute($args);
 
     /* --- Task-to-Ticket Synchronization FIX (Final Stable Logic) --- */
-    // Only attempt synchronization if the necessary tables exist.
     if (table_exists_robustly($pdo, 'tasks') && table_exists_robustly($pdo, 'scheduled_task_run_tickets')) {
         if (($status === 'Resolved' || $status === 'Closed') && $wasStatus !== 'Resolved' && $wasStatus !== 'Closed') {
             // 1. Find the RTT IDs linked to this ticket
@@ -476,40 +508,30 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
     /* -------------------------------------- */
 
 
+    // Reload the updated ticket data for consistent logging/notifications
+    $updated_row = $pdo->prepare("SELECT * FROM tickets WHERE id=?"); $updated_row->execute([$id]); $after = $updated_row->fetch(PDO::FETCH_ASSOC) ?: [];
+    $actor_email = $me['email'] ?? '';
+
     // Logs + notices
     if ((string)$before['agent_id'] !== (string)$agent_id) {
       add_log($pdo,$id,$me['id'],'assign',[
         'from_id'=>$before['agent_id'],'from_name'=>user_name($pdo,(int)$before['agent_id']),
         'to_id'=>$agent_id,'to_name'=>user_name($pdo,$agent_id)
       ]);
-      if ($agent_id) {
-        $agentEmail = $pdo->prepare("SELECT email FROM users WHERE id=?");
-        $agentEmail->execute([$agent_id]);
-        if ($email = $agentEmail->fetchColumn()) {
-          $tnSt = $pdo->prepare("SELECT ticket_number,subject,queue,priority,status FROM tickets WHERE id=?");
-          $tnSt->execute([$id]);
-          $tmeta = $tnSt->fetch(PDO::FETCH_ASSOC) ?: [];
-          $link  = (defined('APP_BASE_URL')? rtrim(APP_BASE_URL,'/') : '').'/tickets.php#t'.$id;
-          $msg   = "You’ve been assigned ticket **{$tmeta['ticket_number']}** — *".($tmeta['subject'] ?? 'Ticket')."*.\n".
-                   "Queue: `".($tmeta['queue'] ?? '-')."`  |  Priority: `".($tmeta['priority'] ?? '-')."`  |  Status: `".($tmeta['status'] ?? '-')."`\n".
-                   ($link ? "[Open in Dashboard Ticketing]($link)" : "");
-          @zulip_send_pm($email, $msg);
-        }
-      }
+      $msg_body = "Ticket assigned to " . ($after['agent_name'] ?? 'Unassigned');
+      notify_ticket_recipients($pdo, $id, 'assign', $after, $msg_body, [$actor_email]);
     }
     if ((string)$before['status'] !== (string)$status) {
-      add_log($pdo,$id,$me['id'],'status',['from'=>$before['status'],'to'=>$status,'pending_until'=>($status==='Pending'?$pending_until:null)]);
+      $log_meta = ['from'=>$before['status'],'to'=>$status,'pending_until'=>($status==='Pending'?$pending_until:null)];
+      add_log($pdo,$id,$me['id'],'status',$log_meta);
       
-      // Notify requester on status change
-      $reqEmail = $before['requester_email'] ?? null;
-      if ($reqEmail) {
-          $tnSt = $pdo->prepare("SELECT ticket_number,subject FROM tickets WHERE id=?");
-          $tnSt->execute([$id]);
-          $tmeta = $tnSt->fetch(PDO::FETCH_ASSOC) ?: [];
-          $msg = "Ticket **{$tmeta['ticket_number']}** — *".($tmeta['subject'] ?? 'Ticket')."* status updated to `{$status}`.\n".
-                 "You requested this ticket.";
-          @zulip_send_pm($reqEmail, $msg);
-      }
+      $msg_body = "Status changed from `{$before['status']}` to `{$status}`";
+      $template_type = in_array($status, ['Resolved', 'Closed']) ? strtolower($status) : 'status_change';
+
+      notify_ticket_recipients($pdo, $id, $template_type, $after, $msg_body, [$actor_email]);
+    }
+    if ((string)$before['cc_emails'] !== (string)$cc_emails) {
+        add_log($pdo,$id,$me['id'],'other',['field'=>'cc_emails','from'=>$before['cc_emails'],'to'=>$cc_emails]);
     }
     if ($queue!==null && (string)$before['queue'] !== (string)$queue) {
       add_log($pdo,$id,$me['id'],'queue',['from'=>$before['queue'],'to'=>$queue]);
@@ -546,24 +568,22 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       add_log($pdo,$ticket_id,$me['id'],'comment',['length'=>mb_strlen($body)]);
 
       // Re-open if closed
-      $cur = $pdo->prepare("SELECT status, agent_id, ticket_number, subject, queue, priority FROM tickets WHERE id=?");
+      $cur = $pdo->prepare("SELECT * FROM tickets WHERE id=?");
       $cur->execute([$ticket_id]);
       $row = $cur->fetch(PDO::FETCH_ASSOC);
+      
+      $actor_email = $me['email'] ?? '';
+      $msg_body = "New comment added by {$me['first_name']} {$me['last_name']}: \n\n > {$body}";
+
       if ($row && (string)$row['status'] === 'Closed') {
         $pdo->prepare("UPDATE tickets SET status='Open', pending_until=NULL WHERE id=?")->execute([$ticket_id]);
         add_log($pdo,$ticket_id,$me['id'],'status',['from'=>'Closed','to'=>'Open','reason'=>'comment_on_closed']);
-        if (!empty($row['agent_id'])) {
-          $getEmail = $pdo->prepare("SELECT email FROM users WHERE id=?");
-          $getEmail->execute([(int)$row['agent_id']]);
-          if ($email = $getEmail->fetchColumn()) {
-            $link = (defined('APP_BASE_URL')? rtrim(APP_BASE_URL,'/') : '').'/tickets.php#t'.$ticket_id;
-            $msg  = "Ticket **{$row['ticket_number']}** — *".($row['subject'] ?? 'Ticket')."* has **re-opened** (new comment on closed ticket).\n".
-                    "Queue: `".($row['queue'] ?? '-')."`  |  Priority: `".($row['priority'] ?? '-')."`\n".
-                    ($link ? "[Open in Dashboard Ticketing]($link)" : "");
-            @zulip_send_pm($email, $msg);
-          }
-        }
+        $row['status'] = 'Open'; // Update locally for notification context
+        $msg_body .= "\n\nTicket was re-opened by new comment.";
       }
+
+      // Notify all recipients
+      notify_ticket_recipients($pdo, $ticket_id, 'comment', $row, $msg_body, [$actor_email]);
     }
     header('Location: tickets.php?msg=comment_added#t'.$ticket_id); exit;
   }
@@ -673,6 +693,7 @@ $sql = "
          CONCAT_WS(' ',au.first_name,au.last_name) AS agent_name,
          l.name AS location_name,
          (SELECT COUNT(*) FROM ticket_comments c WHERE c.ticket_id=t.id) AS comments_count,
+         (SELECT COUNT(*) FROM ticket_followers tf WHERE tf.ticket_id=t.id AND tf.user_id=?) AS is_following,
          rto.id AS related_to_id,
          rto.label AS related_leaf
   FROM tickets t
@@ -683,7 +704,8 @@ $sql = "
   $whereSql
   ORDER BY t.id DESC
 ";
-$st = $pdo->prepare($sql); $st->execute($params);
+$st = $pdo->prepare($sql);
+$st->execute(array_merge([$me['id']], $params)); // ADDED $me['id'] for is_following column
 $tickets = $st->fetchAll(PDO::FETCH_ASSOC);
 
 /* Build full related_to path per ticket */
@@ -857,7 +879,9 @@ include __DIR__ . '/partials/header.php';
                 'location_id'=>$t['location_id'],'location_name'=>$t['location_name'],'queue'=>$t['queue'],
                 'created_at'=>$t['created_at'],'created_by_name'=>$t['created_by_name'],
                 'related_to_id'=>$t['related_to_id'],'related_to_path'=>$t['related_to_path'],
-                'pending_until'=>$t['pending_until']
+                'pending_until'=>$t['pending_until'],
+                'cc_emails'=>$t['cc_emails'] ?? '', // NEW: CC emails
+                'is_following'=>!empty($t['is_following']) // NEW: Is following
               ], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'></span>
               <span id="cdata-<?= $tid ?>" data-comments='<?= e(json_encode($commentsByTicket[$tid] ?? [], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'
                     data-atts='<?= e(json_encode($attachmentsByTicket[$tid] ?? [], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'
@@ -913,6 +937,9 @@ include __DIR__ . '/partials/header.php';
         </div>
         <div id="new_pending_wrap" style="display:none"><label class="label">Pending until</label><input class="input" type="datetime-local" name="pending_until" id="new_pending_until"></div>
         <div class="grid" style="grid-template-columns:1fr">
+          <label class="label">CC Emails (comma sep.)</label><input class="input" type="text" name="cc_emails" placeholder="user@domain.com, other@domain.com">
+        </div>
+        <div class="grid" style="grid-template-columns:1fr">
           <label class="label">Message</label><textarea class="input" name="description" rows="6" placeholder="Write your message…" required></textarea>
         </div>
         <div><label class="label">Attachments</label><input class="input" type="file" name="attachments[]" multiple><small style="color:#666">Allowed: pdf, images, doc/xls/ppt, csv, txt</small></div>
@@ -929,12 +956,20 @@ include __DIR__ . '/partials/header.php';
     <div class="modal-h"><h3 id="conv_subject">Ticket</h3><button class="btn" onclick="closeModal('ticket')">✕</button></div>
     <div class="modal-b">
       <div class="conv-header">
+        <form method="post" class="inline-form" id="followForm" style="flex:1 1 100%">
+            <?php csrf_input(); ?>
+            <input type="hidden" name="id" id="follow_ticket_id">
+            <input type="hidden" name="is_following" id="is_following_state">
+            <button class="btn btn-light" name="toggle_follow" value="1" id="follow_btn" type="submit" style="width:140px"></button>
+        </form>
+
         <div class="addr">
           <div><strong>From:</strong> <span id="conv_from"></span></div>
           <div><strong>To:</strong> <span id="conv_to"></span></div>
           <div><strong>Queue:</strong> <span id="conv_queue"></span></div>
           <div><strong>Location:</strong> <span id="conv_location"></span></div>
           <div><strong>Related To:</strong> <span id="conv_related"></span></div>
+          <div><strong>CC:</strong> <span id="conv_cc_display"></span></div>
         </div>
         <form method="post" id="conv_update" class="controls">
           <?php csrf_input(); ?>
@@ -947,6 +982,7 @@ include __DIR__ . '/partials/header.php';
           <?php endif; ?>
           <label><span>Related To</span><select name="related_to_id" id="conv_related_sel" class="input"><option value="">—</option><?php foreach($relatedKV as $rid=>$path): ?><option value="<?= (int)$rid ?>"><?= e($path) ?></option><?php endforeach; ?></select></label>
           <label id="conv_pending_wrap" style="display:none"><span>Pending until</span><input class="input" type="datetime-local" name="pending_until" id="conv_pending_until"></label>
+          <label id="conv_cc_wrap" style="flex:1 1 100%"><span>CC Emails (comma sep.)</span><input class="input input-sm" name="cc_emails" id="conv_cc_input" value=""></label>
           <button class="btn btn-primary" name="update" value="1">Save</button>
         </form>
       </div>
@@ -1120,7 +1156,7 @@ function saveDefault(){
   });
 })();
 
-/* Build the conversation thread with logs inline */
+/* Build the conversation thread with logs inline (Updated to handle CC/Follower UI) */
 function openTicketModal(id){
   const tEl = document.getElementById('tdata-'+id);
   const cEl = document.getElementById('cdata-'+id);
@@ -1138,6 +1174,7 @@ function openTicketModal(id){
   document.getElementById('conv_queue').textContent = t.queue || '-';
   document.getElementById('conv_location').textContent = t.location_name || '-';
   document.getElementById('conv_related').textContent = t.related_to_path || '-';
+  document.getElementById('conv_cc_display').textContent = t.cc_emails || '-'; // NEW: CC Display
 
   document.getElementById('conv_id').value = t.id;
   document.getElementById('conv_status').value = t.status || '';
@@ -1145,6 +1182,16 @@ function openTicketModal(id){
   document.getElementById('conv_agent').value = t.agent_id || '';
   const qsel = document.getElementById('conv_queue_sel'); if (qsel) qsel.value = t.queue || '';
   const rsel = document.getElementById('conv_related_sel'); if (rsel) rsel.value = t.related_to_id || '';
+  document.getElementById('conv_cc_input').value = t.cc_emails || ''; // NEW: CC Input
+
+  // Update Follow button state
+  const isFollowing = !!t.is_following;
+  const followBtn = document.getElementById('follow_btn');
+  followBtn.innerHTML = isFollowing ? '★ Following' : '☆ Follow';
+  followBtn.classList.toggle('btn-primary', !isFollowing);
+  followBtn.classList.toggle('btn-light', isFollowing);
+  document.getElementById('follow_ticket_id').value = id;
+  document.getElementById('is_following_state').value = isFollowing ? '1' : '0';
 
   const pWrap = document.getElementById('conv_pending_wrap');
   const pInput = document.getElementById('conv_pending_until');

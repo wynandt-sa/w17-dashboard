@@ -150,62 +150,58 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
       
       $first = trim($_POST['first_name'] ?? '');
       $last  = trim($_POST['last_name'] ?? '');
-      $email = trim($_POST['email'] ?? '');
-      $usern = trim($_POST['username'] ?? '');
-      $pwd   = trim($_POST['password'] ?? '');
-
-      // --- Admin/Manager can edit all basic fields. Simple User can edit only some ---
-      $role  = $is_admin ? (($_POST['role'] ?? 'user') === 'admin' ? 'admin' : 'user') : null;
-      $active= $is_admin ? (isset($_POST['active']) ? 1 : 0) : null;
-      $mgr   = $is_admin ? ((int)($_POST['manager_id'] ?? 0) ?: null) : null;
-      $loc   = $is_admin ? ((int)($_POST['location_id'] ?? 0) ?: null) : null;
-      $queues= $is_admin ? (array)($_POST['queues'] ?? []) : [];
-      
-      // Fields editable by all users/managers of subordinates
       $dob   = $_POST['date_of_birth'] ?: null;
       $anniv = $_POST['work_anniversary'] ?: null;
       $dept  = trim($_POST['department'] ?? '');
       $job   = trim($_POST['job_title'] ?? '');
       $phone = trim($_POST['phone'] ?? '');
-      
-      if ($first==='' || $last==='' || $email==='' || $usern==='') {
-        throw new RuntimeException('Please complete all required fields (Name, Email, Username).');
+      $pwd   = trim($_POST['password'] ?? '');
+
+      if ($first==='' || $last==='') {
+        throw new RuntimeException('Please complete all required fields (Name).');
       }
 
-      $sets = "first_name=?, last_name=?, email=?, username=?, date_of_birth=?, work_anniversary=?, department=?, job_title=?, phone=?";
-      $args = [$first,$last,$email,$usern,$dob,$anniv,$dept,$job,$phone];
+      // 1. Get current values for protected fields if not admin
+      $st_old = $pdo->prepare("SELECT email, username, role, active, manager_id, location_id FROM users WHERE id=?");
+      $st_old->execute([$id]);
+      $old_u = $st_old->fetch(PDO::FETCH_ASSOC);
 
-      // Admin/Manager cannot change role/active status unless Admin
-      if (!$is_admin && ($role !== null || $active !== null)) {
-           // Should not happen if the UI is correct, but just in case
-          throw new RuntimeException('Unauthorized attempt to modify protected fields.');
-      }
+      // 2. Determine final values based on role (Admin takes POST, User takes existing)
+      // FIX: Admin always takes POST data for email/username, fixing the persistence bug.
+      $final_email = $is_admin ? trim($_POST['email'] ?? '') : $old_u['email'];
+      $final_usern = $is_admin ? trim($_POST['username'] ?? '') : $old_u['username'];
+      $final_role  = $is_admin ? (($_POST['role'] ?? 'user') === 'admin' ? 'admin' : 'user') : $old_u['role'];
+      $final_active= $is_admin ? (isset($_POST['active']) ? 1 : 0) : $old_u['active'];
+      $final_mgr   = $is_admin ? ((int)($_POST['manager_id'] ?? 0) ?: null) : $old_u['manager_id'];
+      $final_loc   = $is_admin ? ((int)($_POST['location_id'] ?? 0) ?: null) : $old_u['location_id'];
       
-      // Add Admin-only fields to the update query
-      if ($is_admin) {
-          $sets .= ", role=?, active=?, manager_id=?, location_id=?";
-          $args = array_merge($args, [$role, $active, $mgr, $loc]);
-      }
-      
+      // 3. Build SET clause
+      $sets = "first_name=?, last_name=?, email=?, username=?, role=?, active=?, manager_id=?, location_id=?, date_of_birth=?, work_anniversary=?, department=?, job_title=?, phone=?";
+      $args = [
+          $first, $last, $final_email, $final_usern, $final_role, $final_active, $final_mgr, $final_loc,
+          $dob, $anniv, $dept, $job, $phone
+      ];
+
       // Password change logic
       if ($PASSWORD_COL && $pwd!=='') {
         $sets .= ", $PASSWORD_COL=?";
         $args[] = password_hash($pwd, PASSWORD_DEFAULT);
       }
-      $sets .= " WHERE id=?";
-      $args[] = $id;
-
-      $pdo->prepare("UPDATE users SET $sets")->execute($args);
-
-      // queues (Admin only)
+      
+      // Admin queue update logic
       if ($is_admin) {
           $pdo->prepare("DELETE FROM user_queue_access WHERE user_id=?")->execute([$id]);
-          $sel = array_values(array_intersect($QUEUE_VALUES, $queues));
+          $sel = array_values(array_intersect($QUEUE_VALUES, (array)($_POST['queues'] ?? [])));
           if ($sel) {
             $ins = $pdo->prepare("INSERT INTO user_queue_access (user_id,queue) VALUES (?,?)");
             foreach ($sel as $q) $ins->execute([$id,$q]);
           }
       }
+      
+      $sets .= " WHERE id=?";
+      $args[] = $id;
+
+      $pdo->prepare("UPDATE users SET $sets")->execute($args);
 
       $msg = 'saved';
       header('Location: users.php?id='.$id.'&msg='.$msg); exit;
@@ -431,8 +427,9 @@ include __DIR__ . '/partials/header.php';
         <input type="hidden" name="id" id="f_id">
         <div class="grid" style="grid-template-columns:1fr"><label class="label">First Name *</label><input class="input" name="first_name" id="f_first" required></div>
         <div class="grid" style="grid-template-columns:1fr"><label class="label">Last Name *</label><input class="input" name="last_name" id="f_last" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Email *</label><input class="input" type="email" name="email" id="f_email" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Username *</label><input class="input" name="username" id="f_usern" required></div>
+        
+        <div class="grid" style="grid-template-columns:1fr"><label class="label">Email * <span class="field-note" id="note_email"></span></label><input class="input" type="email" name="email" id="f_email" required></div>
+        <div class="grid" style="grid-template-columns:1fr"><label class="label">Username * <span class="field-note" id="note_usern"></span></label><input class="input" name="username" id="f_usern" required></div>
         
         <div id="field_role" class="field_admin">
           <label class="label">Role</label>
@@ -525,11 +522,12 @@ include __DIR__ . '/partials/header.php';
 .chipset{display:flex;gap:.5rem;flex-wrap:wrap}
 .chip{display:inline-flex;align-items:center;gap:.35rem;border:1px solid var(--gray-200);border-radius:999px;padding:.35rem .6rem;background:#fafbfc}
 .btn-icon{padding:.35rem .5rem}
+.field-note{font-weight:400;font-style:italic;color:var(--muted);font-size:.9em}
 </style>
 <script>
 const IS_ADMIN = <?= $is_admin ? 'true' : 'false' ?>;
-const MY_ID = <?= $my_id ?>;
-const IS_MANAGER = <?= $is_manager ? 'true' : 'false' ?>;
+const MY_ID = <?= (int)$me['id'] ?>;
+const IS_MANAGER = <?= is_manager() ? 'true' : 'false' ?>;
 
 <?php if ($is_list_view): ?>
 /* row click opens edit */
@@ -546,9 +544,9 @@ const IS_MANAGER = <?= $is_manager ? 'true' : 'false' ?>;
 function openNew(){
   const f = document.querySelector('#modal-new-user form');
   f.reset();
-  document.getElementById('modal-new-user').style.display='flex';
+  window.openModal('modal-new-user');
 }
-function closeNew(){ document.getElementById('modal-new-user').style.display='none'; }
+function closeNew(){ window.closeModal('modal-new-user'); }
 
 function openEdit(id){
   const el = document.getElementById('u'+id);
@@ -558,50 +556,69 @@ function openEdit(id){
   
   const is_self = id === MY_ID;
 
+  // Helper for safe date to <input type="date">
+  function safeDate(v){ return /^\d{4}-\d{2}-\d{2}$/.test((v||'')) ? v : ''; }
+
   document.getElementById('f_id').value   = u.id || '';
   document.getElementById('del_id').value = u.id || '';
+  
+  // Basic editable fields
   document.getElementById('f_first').value= u.first_name || '';
   document.getElementById('f_last').value = u.last_name || '';
-  document.getElementById('f_email').value= u.email || '';
-  document.getElementById('f_usern').value= u.username || '';
-  
   document.getElementById('f_phone').value= u.phone || '';
-  
   document.getElementById('f_dept').value = u.department || '';
   document.getElementById('f_job').value  = u.job_title || '';
-  document.getElementById('f_dob').value  = u.date_of_birth || '';
-  document.getElementById('f_anniv').value= u.work_anniversary || '';
+  document.getElementById('f_dob').value  = safeDate(u.date_of_birth);
+  document.getElementById('f_anniv').value= safeDate(u.work_anniversary);
   
-  // --- Admin-only fields ---
+  // Admin-controlled fields - set value for all
+  document.getElementById('f_email').value= u.email || '';
+  document.getElementById('f_usern').value= u.username || '';
   document.getElementById('f_role').value = u.role || 'user';
   document.getElementById('f_mgr').value  = u.manager_id || '';
   document.getElementById('f_loc').value  = u.location_id || '';
-  document.getElementById('f_active').checked = !!(+u.active);
+  document.getElementById('f_active').checked = (u.active == 1); // FIX: Ensure active checkbox correctly reflects data
   
-  // Hide Admin fields if not Admin
+  // --- Admin/Self-service access control ---
+  
+  // 1. Admin only fields (role, active, manager, location, queues)
   document.querySelectorAll('.field_admin').forEach(el=>{
-    el.style.display = IS_ADMIN ? 'grid' : 'none';
+    // Only admins see these controls
+    el.style.display = IS_ADMIN ? 'grid' : 'none'; 
   });
   
-  document.getElementById('edit_dlg_title').textContent = is_self ? 'Edit My Profile' : 'Edit User';
+  // 2. Readonly fields for non-admin on email/username (Admin is always able to edit)
+  const emailInput = document.getElementById('f_email');
+  const usernameInput = document.getElementById('f_usern');
+  
+  const emailNote = document.getElementById('note_email');
+  const usernNote = document.getElementById('note_usern');
+
+  const shouldBeReadOnly = !IS_ADMIN;
+
+  emailInput.readOnly = shouldBeReadOnly;
+  usernameInput.readOnly = shouldBeReadOnly;
+
+  emailNote.textContent = shouldBeReadOnly ? ' (Read Only)' : '';
+  usernNote.textContent = shouldBeReadOnly ? ' (Read Only)' : '';
+  
+  emailInput.classList.toggle('input-readonly', shouldBeReadOnly);
+  usernameInput.classList.toggle('input-readonly', shouldBeReadOnly);
 
 
-  // tick queues
+  // 3. Queue checkboxes (Admin only)
   document.querySelectorAll('#modal-edit-user input.qcb').forEach(cb => {
     cb.checked = qs.includes(cb.value);
     cb.disabled = !IS_ADMIN;
   });
 
-  document.getElementById('modal-edit-user').style.display='flex';
-}
-function closeEdit(){ document.getElementById('modal-edit-user').style.display='none'; }
+  document.getElementById('edit_dlg_title').textContent = is_self ? 'Edit My Profile' : 'Edit User';
 
-// Auto-open profile view for non-admin users redirected from the list view
-(function(){
-    if (!IS_ADMIN && window.location.search.includes('id=<?= $my_id ?>')) {
-        openEdit(MY_ID);
-    }
-})();
+
+  window.openModal('modal-edit-user');
+}
+function closeEdit(){ window.closeModal('modal-edit-user'); }
+
 </script>
 
 <?php include __DIR__ . '/partials/footer.php'; ?>

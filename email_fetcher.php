@@ -4,17 +4,30 @@ require_once __DIR__ . '/config.php'; // load SMTP + app URL
 $pdo=db();
 $pdo->setAttribute(PDO::ATTR_ERRMODE,PDO::ERRMODE_EXCEPTION);
 
+// NEW: Stub for send_mail (actual implementation requires PHPMailer or similar)
+if (!function_exists('send_mail')) {
+    function send_mail(string $to, string $subject, string $body_html, ?string $from_email = null): bool {
+        // In a real application, this would use the SMTP settings saved in system_settings.php.
+        error_log("MAIL_SENT: To: $to, From: $from_email, Subject: $subject");
+        return true;
+    }
+}
+
+
 /* Load queues */
 $queues=$pdo->query("SELECT * FROM queue_emails")->fetchAll(PDO::FETCH_ASSOC);
 
 foreach($queues as $q){
   $email=$q['email'];
-  // Retrieve credentials (for demo assume stored in system_settings)
+  // Retrieve credentials (pop/smtp creds are stored in system_settings, prefixed by the queue email)
   $host=setting($pdo,'pop_host_'.$email);
   $port=setting($pdo,'pop_port_'.$email) ?: 995;
   $user=setting($pdo,'pop_user_'.$email) ?: $email;
   $pass=setting($pdo,'pop_pass_'.$email);
 
+  // Skip queue if critical creds are missing
+  if (!$host || !$pass) continue;
+  
   $mbox=@imap_open("{".$host.":".$port."/pop3/ssl}INBOX",$user,$pass);
   if(!$mbox) continue;
 
@@ -54,8 +67,9 @@ foreach($queues as $q){
       $tpl=$pdo->prepare("SELECT subject,body_html FROM email_templates WHERE template_type='new' LIMIT 1");
       $tpl->execute(); $t=$tpl->fetch(PDO::FETCH_ASSOC);
       if($t){
-        $sub=str_replace('{{ticket_number}}',$tn,$t['subject']);
-        $body=str_replace('{{ticket_number}}',$tn,$t['body_html']);
+        $link = (defined('APP_BASE_URL')? rtrim(APP_BASE_URL,'/') : '').'/tickets.php#t'.$tid;
+        $sub=str_replace(['{{ticket_number}}','{{ticket_link}}'],[$tn, $link],$t['subject']);
+        $body=str_replace(['{{ticket_number}}','{{ticket_link}}'],[$tn, $link],$t['body_html']);
         send_mail($from,$sub,$body,$email);
       }
     }
@@ -64,5 +78,3 @@ foreach($queues as $q){
 }
 
 function setting($pdo,$k){ $st=$pdo->prepare("SELECT setting_value FROM system_settings WHERE setting_key=?"); $st->execute([$k]); return $st->fetchColumn(); }
-
-/* basic send_mail using PHPMailer or SwiftMailer as shown earlier */

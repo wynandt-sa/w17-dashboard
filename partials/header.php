@@ -220,7 +220,7 @@ body{
 .auth-body{padding:1.25rem 1.5rem 1.75rem}
 .auth-group{margin:1rem 0}
 .auth-input{width:100%;padding:.95rem 1rem;border:1px solid var(--gray-300);border-radius:14px;background:#fbfbfb}
-.auth-input:focus{outline:none;border-color:var(--primary);background:#fff;box-shadow:0 0 0 4px rgba(136,194,143,.18)}
+.auth-input:focus{outline:none;border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgba(136,194,143,.22)}
 .auth-btn{width:100%;border:0;border-radius:14px;padding:.95rem 1.2rem;font-weight:800;font-size:1rem;cursor:pointer;background:var(--primary);color:#fff}
 .auth-btn:hover{filter:brightness(.96)}
 .auth-muted{margin-top:.9rem;text-align:center;font-size:.95rem;color:var(--muted)}
@@ -403,6 +403,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <?php if(has_children($me['id'] ?? 0, $pdo)): ?>
           <a href="<?= BASE_URL ?>/reports.php" class="<?= $page==='reports.php'?'active':'' ?>">📈 Reports</a>
         <?php endif; ?>
+        <a href="<?= BASE_URL ?>/logout.php">🚪 Logout</a>
       </nav>
     </aside>
   <?php endif; ?>
@@ -414,7 +415,6 @@ document.addEventListener('DOMContentLoaded', () => {
         <div class="title">Workshop17 Dashboard</div>
         <div class="spacer"></div>
 
-        <!-- User dropdown with Logout -->
         <div class="user-area dropdown">
           <button class="user-chip" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
             <div class="avatar" aria-hidden="true">
@@ -427,6 +427,7 @@ document.addEventListener('DOMContentLoaded', () => {
           </button>
           <div class="dropdown-menu" role="menu" aria-label="User menu">
             <a class="dropdown-item" href="<?= BASE_URL ?>/dashboard.php">🏠 Dashboard</a>
+            <a class="dropdown-item" href="<?= BASE_URL ?>/users.php?id=<?= (int)$me['id'] ?>">👤 My Profile</a>
             <div class="dropdown-sep"></div>
             <a class="dropdown-item" href="<?= BASE_URL ?>/logout.php">🚪 Logout</a>
           </div>
@@ -435,4 +436,4 @@ document.addEventListener('DOMContentLoaded', () => {
     <?php endif; ?>
 
     <section class="page">
-      <!-- Page content starts here -->
+      

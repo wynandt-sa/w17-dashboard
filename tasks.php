@@ -138,77 +138,92 @@ CREATE TABLE IF NOT EXISTS task_run_checklist (
 ");
 
 
-/* ---------- Ticket creation (matches your tickets schema) ---------- */
+/* ---------- Ticket creation (modified for task tickets) ---------- */
 function create_ticket_auto(PDO $pdo, array $payload){
-  $wantCols = ['ticket_number','subject','requester_email','description','status','priority','created_by','created_at', 'agent_id'];
-  $cols = [];
-  foreach ($wantCols as $c) {
-    $s=$pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tickets' AND COLUMN_NAME=? LIMIT 1");
-    $s->execute([$c]); if ($s->fetchColumn()) $cols[]=$c;
-  }
-  if (!in_array('subject',$cols,true)) throw new RuntimeException('tickets.subject missing');
-
-  $priorityEnum = []; $priorityDefault = null;
-  if (in_array('priority',$cols,true)) {
-    $s = $pdo->prepare("SELECT COLUMN_TYPE, COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tickets' AND COLUMN_NAME='priority' LIMIT 1");
-    $s->execute();
-    if ($row = $s->fetch(PDO::FETCH_ASSOC)) {
-      if (preg_match_all("/'([^']*)'/", (string)$row['COLUMN_TYPE'], $m)) $priorityEnum = $m[1];
-      $priorityDefault = $row['COLUMN_DEFAULT'] ?? null;
+    $wantCols = ['ticket_number','subject','requester_email','description','status','priority','created_by','created_at', 'agent_id'];
+    $cols = [];
+    foreach ($wantCols as $c) {
+        $s=$pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tickets' AND COLUMN_NAME=? LIMIT 1");
+        $s->execute([$c]); if ($s->fetchColumn()) $cols[]=$c;
     }
-  }
+    if (!in_array('subject',$cols,true)) throw new RuntimeException('tickets.subject missing');
 
-  $payload2 = $payload;
-  $bodyText = $payload['description'] ?? '';
-  if (trim($bodyText)==='') $bodyText = 'Generated from template.';
-  if (in_array('description',$cols,true) && !isset($payload2['description'])) $payload2['description'] = $bodyText;
-
-  $params = []; $columns_list = [];
-  foreach ($cols as $c) {
-    if ($c==='ticket_number') {
-      $columns_list[] = $c;
-      $n = (int)$pdo->query("SELECT IFNULL(MAX(id),0)+1 FROM tickets")->fetchColumn();
-      $params[":$c"] = date('Ymd').'-'.str_pad((string)$n,4,'0',STR_PAD_LEFT);
-      continue;
-    }
-
-    if ($c==='status') {
-      $columns_list[] = $c;
-      $params[":$c"] = $payload2['status'] ?? 'Open';
-      continue;
-    }
-
-    if ($c==='priority') {
-      $columns_list[] = $c;
-      $want = $payload2['priority'] ?? null;
-      if (!$want || !in_array($want, $priorityEnum, true)) {
-        $want = $priorityDefault ?: ($priorityEnum[0] ?? 'Medium');
-      }
-      $params[":$c"] = $want;
-      continue;
+    // NEW: Get creator/manager info (task creator becomes ticket requester)
+    $requester_email = null;
+    $requester_id = $payload['created_by'] ?? null; // ID of the manager who created the task
+    if ($requester_id) {
+        $st_req = $pdo->prepare("SELECT email FROM users WHERE id=?");
+        $st_req->execute([$requester_id]);
+        $requester_email = $st_req->fetchColumn();
     }
     
-    // Assignee in task context becomes Agent in ticket context
-    if ($c==='agent_id') {
+    $priorityEnum = []; $priorityDefault = null;
+    if (in_array('priority',$cols,true)) {
+        $s = $pdo->prepare("SELECT COLUMN_TYPE, COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='tickets' AND COLUMN_NAME='priority' LIMIT 1");
+        $s->execute();
+        if ($row = $s->fetch(PDO::FETCH_ASSOC)) {
+            if (preg_match_all("/'([^']*)'/", (string)$row['COLUMN_TYPE'], $m)) $priorityEnum = $m[1];
+            $priorityDefault = $row['COLUMN_DEFAULT'] ?? null;
+        }
+    }
+
+    $payload2 = $payload;
+    $bodyText = $payload['description'] ?? '';
+    if (trim($bodyText)==='') $bodyText = 'Generated from template.';
+    if (in_array('description',$cols,true) && !isset($payload2['description'])) $payload2['description'] = $bodyText;
+
+    $params = []; $columns_list = [];
+    foreach ($cols as $c) {
+        if ($c==='ticket_number') {
+            $columns_list[] = $c;
+            $n = (int)$pdo->query("SELECT IFNULL(MAX(id),0)+1 FROM tickets")->fetchColumn();
+            $params[":$c"] = date('Ymd').'-'.str_pad((string)$n,4,'0',STR_PAD_LEFT);
+            continue;
+        }
+
+        if ($c==='status') {
+            $columns_list[] = $c;
+            $params[":$c"] = $payload2['status'] ?? 'Open';
+            continue;
+        }
+
+        if ($c==='priority') {
+            $columns_list[] = $c;
+            $want = $payload2['priority'] ?? null;
+            if (!$want || !in_array($want, $priorityEnum, true)) {
+                $want = $priorityDefault ?: ($priorityEnum[0] ?? 'Medium');
+            }
+            $params[":$c"] = $want;
+            continue;
+        }
+        
+        if ($c==='requester_email') { // NEW: Set requester email to task creator's email
+            $columns_list[] = $c;
+            $params[":$c"] = $requester_email;
+            continue;
+        }
+        
+        // Assignee in task context becomes Agent in ticket context
+        if ($c==='agent_id') {
+            $columns_list[] = $c;
+            $params[":$c"] = $payload2['assignee_id'] ?? null; 
+            continue;
+        }
+
+        if ($c==='created_at') {
+            $columns_list[] = $c;
+            $params[":$c"] = $payload2['created_at'] ?? date('Y-m-d H:i:s');
+            continue;
+        }
+
         $columns_list[] = $c;
-        $params[":$c"] = $payload2['assignee_id'] ?? null; 
-        continue;
+        $params[":$c"] = $payload2[$c] ?? null;
     }
 
-    if ($c==='created_at') {
-      $columns_list[] = $c;
-      $params[":$c"] = $payload2['created_at'] ?? date('Y-m-d H:i:s');
-      continue;
-    }
-
-    $columns_list[] = $c;
-    $params[":$c"] = $payload2[$c] ?? null;
-  }
-
-  $sql = "INSERT INTO tickets (".implode(',',$columns_list).") VALUES (".implode(',', array_keys($params)).")";
-  $st = $pdo->prepare($sql);
-  $st->execute($params);
-  return (int)$pdo->lastInsertId();
+    $sql = "INSERT INTO tickets (".implode(',',$columns_list).") VALUES (".implode(',', array_keys($params)).")";
+    $st = $pdo->prepare($sql);
+    $st->execute($params);
+    return (int)$pdo->lastInsertId();
 }
 
 /* ---------- Compute next run (weekday mapping fix) ---------- */
@@ -460,16 +475,25 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
         if ($items) { $body .= "Checklist:\n"; foreach ($items as $it) { $body .= "- [ ] ".$it['item_text'].($it['is_required']?' (required)':'')."\n"; } }
         $subject = $task['title'].' — '.date('D d M');
 
+        // Manager who created the task is the ticket's internal requester
+        $manager_id = $task['created_by']; 
+        
         foreach ($assignees as $uid) {
           $tid = create_ticket_auto($pdo, [
             'subject'       => $subject,
             'description'   => $body,
             'status'        => 'Open',
-            'priority'      => 'Medium',          // valid enum for your schema
-            'created_by'    => $me['id'] ?? null, // optional tracking
-            // 'requester_email' => $me['email'] ?? null, // optional if you want it
+            'priority'      => 'Medium',          
+            'created_by'    => $manager_id ?? null, // Task creator remains ticket creator
+            'assignee_id'   => (int)$uid,          // Task assignee becomes ticket agent
           ]);
           $pdo->prepare("INSERT INTO scheduled_task_run_tickets (run_id,ticket_id,assignee_id) VALUES (?,?,?)")->execute([$run_id,$tid,$uid]);
+
+          // Checklist item insertion (REQUIRED FOR TASK CHECKLIST)
+          $ins_checklist = $pdo->prepare("INSERT INTO task_run_checklist (ticket_id, item_index) VALUES (?,?)");
+          foreach($items as $idx => $it) {
+              $ins_checklist->execute([$tid, $idx]);
+          }
         }
         $next = compute_next_run($task, new DateTime('tomorrow', new DateTimeZone($task['timezone'] ?: 'Africa/Johannesburg')));
         if ($next) $pdo->prepare("UPDATE scheduled_tasks SET next_run_at=? WHERE id=?")->execute([$nxt?$nxt->format('Y-m-d H:i:s'):null, $task['id']]);
@@ -567,7 +591,7 @@ if ($runs) {
   foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) $runProgress[(int)$row['run_id']] = $row;
 }
 
-// Simple tasks
+// Simple tasks - FILTERED by assignee or creator
 $taskSql = "
   SELECT t.*, CONCAT_WS(' ',u.first_name,u.last_name) AS assignee_user, rtt.ticket_id
   FROM tasks t 
@@ -636,13 +660,14 @@ include __DIR__ . '/partials/header.php';
       <table class="table">
         <thead>
           <tr>
-            <th>Title</th><th>Frequency</th><th>Assignees</th><th>Next Run</th><th>Status</th><th>Actions</th>
+            <th>Title</th><th>Template</th><th>Frequency</th><th>Assignees</th><th>Next Run</th><th>Status</th><th>Actions</th>
           </tr>
         </thead>
         <tbody>
         <?php foreach($scheduled as $s): ?>
           <tr>
             <td><?= e($s['title']) ?></td>
+            <td><?= e($s['template_id'] ?? '-') ?></td>
             <td>
               <span class="badge badge-primary">
                 <?= e(ucfirst($s['schedule_type'])) ?>
@@ -733,7 +758,7 @@ include __DIR__ . '/partials/header.php';
       <p>No tasks assigned to you or created by you.</p>
     <?php else: ?>
       <table class="table">
-        <thead><tr><th>Task</th><th>Assignee</th><th>Due</th><th>Status</th><th>Actions</th></tr></thead>
+        <thead><tr><th>Task</th><th>Assignee</th><th>Due</th><th>Status</th><th>Linked Ticket</th><th>Actions</th></tr></thead>
         <tbody>
         <?php foreach($tasks as $t): ?>
           <tr>
@@ -742,9 +767,16 @@ include __DIR__ . '/partials/header.php';
             <td><?= e($t['due_date']) ?></td>
             <td><span class="badge <?= ($t['status']??'')==='completed'?'badge-success':'badge-warning' ?>"><?= e($t['status'] ?? 'open') ?></span></td>
             <td>
+              <?php if (!empty($t['ticket_id'])): ?>
+                <a href="tickets.php#t<?= (int)$t['ticket_id'] ?>">Ticket #<?= (int)$t['ticket_id'] ?></a>
+              <?php else: ?>
+                —
+              <?php endif; ?>
+            </td>
+            <td>
               <?php if (($t['status']??'')!=='completed'): ?>
                   <button class="btn" type="button" onclick="openSimpleEdit(<?= (int)$t['id'] ?>)">Edit</button>
-                  <?php if (!$t['scheduled_task_run_ticket_id']): // Only allow direct completion if no ticket is linked ?>
+                  <?php if (empty($t['ticket_id'])): // Only allow direct completion if no ticket is linked ?>
                       <form method="post" style="display:inline"><?php csrf_input(); ?>
                         <input type="hidden" name="id" value="<?= (int)$t['id'] ?>">
                         <button class="btn btn-primary" name="complete" value="1">Complete</button>
@@ -1063,6 +1095,10 @@ function fillTemplateForm(t){
 function openSimpleEdit(id){
   const t = (window.SIMPLE_TASKS || []).find(x=>x.id===id);
   if(!t) return;
+  if(t.is_linked) {
+      alert("This task is linked to a ticket and cannot be edited or completed directly from here.");
+      return;
+  }
   document.getElementById('simple_id').value = t.id;
   document.querySelector('#modal-simple input[name="title"]').value = t.title || '';
   document.querySelector('#modal-simple textarea[name="description"]').value = t.description || '';

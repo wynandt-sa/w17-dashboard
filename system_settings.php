@@ -31,9 +31,10 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS queue_emails (
   queue VARCHAR(100) NOT NULL,
   email VARCHAR(255) NOT NULL UNIQUE
 )");
+// EXPANDED ENUM for all email flows
 $pdo->exec("CREATE TABLE IF NOT EXISTS email_templates (
   id INT AUTO_INCREMENT PRIMARY KEY,
-  template_type ENUM('new','pending','closed') NOT NULL UNIQUE,
+  template_type ENUM('new','pending','closed','resolved','comment','status_change') NOT NULL UNIQUE,
   subject VARCHAR(255) NOT NULL,
   body_html TEXT NOT NULL
 )");
@@ -49,6 +50,19 @@ if($_SERVER['REQUEST_METHOD']==='POST'){
                          ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)");
       $st->execute([$k,$v]);
     }
+  }
+
+  // NEW: Save POP/SMTP credentials for a specific queue email
+  if(isset($_POST['queue_cred_save'])){
+      $email = trim($_POST['q_email']??'');
+      if ($email) {
+          foreach(['pop_host','pop_port','pop_user','pop_pass'] as $k){
+              $v = trim($_POST[$k]??'');
+              $st=$pdo->prepare("INSERT INTO system_settings(setting_key,setting_value) VALUES(?,?)
+                                 ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)");
+              $st->execute([$k.'_'.$email,$v]);
+          }
+      }
   }
 
   if(isset($_POST['queue_add'])){
@@ -81,12 +95,28 @@ $smtp = [
 $queues=$pdo->query("SELECT * FROM queue_emails")->fetchAll(PDO::FETCH_ASSOC);
 $templates=$pdo->query("SELECT * FROM email_templates")->fetchAll(PDO::FETCH_ASSOC);
 
+// NEW: Load POP settings for each queue for display/edit
+$queues_with_creds = [];
+foreach($queues as $q) {
+    $email = $q['email'];
+    $q['creds'] = [
+        'pop_host'=>setting($pdo,'pop_host_'.$email),
+        'pop_port'=>setting($pdo,'pop_port_'.$email) ?: 995,
+        'pop_user'=>setting($pdo,'pop_user_'.$email) ?: $email,
+        'pop_pass'=>setting($pdo,'pop_pass_'.$email)
+    ];
+    $queues_with_creds[] = $q;
+}
+
+// NEW: All template types for the select dropdown
+$all_template_types = ['new','pending','closed','resolved','comment','status_change'];
+
 include __DIR__.'/partials/header.php';
 ?>
 <div class="card">
   <div class="card-h"><h3>System Settings</h3></div>
   <div class="card-b">
-    <h4>SMTP Settings</h4>
+    <h4>SMTP Settings (for outbound mail from app)</h4>
     <form method="post">
       <?php csrf_input(); ?>
       <input class="input" name="smtp_host" placeholder="SMTP Host" value="<?=e($smtp['smtp_host'])?>"><br>
@@ -104,19 +134,35 @@ include __DIR__.'/partials/header.php';
 </div>
 
 <div class="card">
-  <div class="card-h"><h4>Queue Email Mapping</h4></div>
+  <div class="card-h"><h4>Queue Email Mapping & Credentials</h4></div>
   <div class="card-b">
-    <form method="post">
+    <h5>Add New Queue</h5>
+    <form method="post" style="display:flex;gap:.5rem;margin-bottom:1.5rem">
       <?php csrf_input(); ?>
       <input class="input" name="queue" placeholder="Queue (e.g. Workshop17)">
       <input class="input" type="email" name="email" placeholder="Queue Email">
       <button class="btn btn-primary" name="queue_add">Add</button>
     </form>
-    <ul>
-      <?php foreach($queues as $q): ?>
-        <li><?=e($q['queue'])?> → <?=e($q['email'])?></li>
-      <?php endforeach; ?>
-    </ul>
+    
+    <h5 style="margin-top:1.5rem">Existing Queues with POP/SMTP Credentials</h5>
+    <?php foreach($queues_with_creds as $q): ?>
+        <div class="card" style="margin-top:.75rem">
+            <div class="card-h" style="padding:0.75rem 1rem">
+                <h4 style="margin:0;font-size:1rem;color:#1f2937"><?=e($q['queue'])?> queue email: <strong><?=e($q['email'])?></strong></h4>
+            </div>
+            <div class="card-b" style="padding-top:0.75rem">
+                <form method="post" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1rem;align-items:end">
+                    <?php csrf_input(); ?>
+                    <input type="hidden" name="q_email" value="<?=e($q['email'])?>">
+                    <input class="input input-sm" name="pop_host" placeholder="POP Host" value="<?=e($q['creds']['pop_host'])?>">
+                    <input class="input input-sm" name="pop_port" placeholder="POP Port" value="<?=e($q['creds']['pop_port'])?>">
+                    <input class="input input-sm" name="pop_user" placeholder="POP User" value="<?=e($q['creds']['pop_user'])?>">
+                    <input class="input input-sm" type="password" name="pop_pass" placeholder="POP Password" value="<?=e($q['creds']['pop_pass'])?>">
+                    <button class="btn btn-primary btn-sm" name="queue_cred_save" style="grid-column:4">Save POP/SMTP</button>
+                </form>
+            </div>
+        </div>
+    <?php endforeach; ?>
   </div>
 </div>
 
@@ -126,18 +172,18 @@ include __DIR__.'/partials/header.php';
     <form method="post">
       <?php csrf_input(); ?>
       <select name="template_type" class="input">
-        <option value="new">New Ticket</option>
-        <option value="pending">Pending</option>
-        <option value="closed">Closed</option>
+        <?php foreach($all_template_types as $type): ?>
+            <option value="<?=e($type)?>"><?=e(ucwords(str_replace('_',' ',$type)))?></option>
+        <?php endforeach; ?>
       </select><br>
-      <input class="input" name="subject" placeholder="Email Subject"><br>
-      <textarea class="input" name="body_html" rows="8" placeholder="HTML body"></textarea><br>
+      <input class="input" name="subject" placeholder="Email Subject (use {{ticket_number}}, {{ticket_link}} etc.)"><br>
+      <textarea class="input" name="body_html" rows="8" placeholder="HTML body (use {{ticket_number}}, {{ticket_link}} etc.)"></textarea><br>
       <button class="btn btn-primary" name="template_save">Save Template</button>
     </form>
-    <h5>Existing Templates</h5>
+    <h5 style="margin-top:1.5rem">Existing Templates</h5>
     <ul>
       <?php foreach($templates as $t): ?>
-        <li><strong><?=e($t['template_type'])?>:</strong> <?=e($t['subject'])?></li>
+        <li><strong><?=e(ucwords(str_replace('_',' ',$t['template_type'])))?>:</strong> <?=e($t['subject'])?></li>
       <?php endforeach; ?>
     </ul>
   </div>

@@ -29,6 +29,110 @@ if (!function_exists('add_log')) {
     }
 }
 
+// NEW: Get template and substitute placeholders
+function get_email_template(PDO $pdo, string $type, array $ticket_data): ?array {
+    $st = $pdo->prepare("SELECT subject, body_html FROM email_templates WHERE template_type = ? LIMIT 1");
+    $st->execute([$type]);
+    $t = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$t) return null;
+
+    $tn = $ticket_data['ticket_number'] ?? 'N/A';
+    $sub = $ticket_data['subject'] ?? 'N/A';
+    $status = $ticket_data['status'] ?? 'N/A';
+    $priority = $ticket_data['priority'] ?? 'N/A';
+    $link = (defined('APP_BASE_URL')? rtrim(APP_BASE_URL,'/') : '').'/tickets.php#t'.($ticket_data['id'] ?? 0);
+
+    $placeholders = [
+        '{{ticket_number}}' => $tn,
+        '{{ticket_subject}}' => $sub,
+        '{{ticket_status}}' => $status,
+        '{{ticket_priority}}' => $priority,
+        '{{ticket_link}}' => $link
+    ];
+
+    $t['subject'] = str_replace(array_keys($placeholders), array_values($placeholders), $t['subject']);
+    $t['body_html'] = str_replace(array_keys($placeholders), array_values($placeholders), $t['body_html']);
+    return $t;
+}
+
+// NEW: Placeholder for send_mail (re-defined here to be available globally in context)
+if (!function_exists('send_mail')) {
+    function send_mail(string $to, string $subject, string $body_html, ?string $from_email = null): bool {
+        // Placeholder implementation for external tools (e.g. Zulip) and internal calls (e.g. email_fetcher.php)
+        error_log("MAIL_SENT_TICKET: To: $to, From: $from_email, Subject: $subject");
+        return true;
+    }
+}
+
+// NEW: Unified Zulip/Email notification logic
+function notify_ticket_recipients(PDO $pdo, int $ticket_id, string $event_type, array $ticket_data, string $message_body_raw, ?array $excluded_emails = []): void {
+    
+    // 1. Determine recipients (Requester, Agent, Followers, CC)
+    $recipients = [];
+    
+    // Followers
+    $followers = $pdo->prepare("SELECT u.email FROM ticket_followers tf JOIN users u ON u.id=tf.user_id WHERE tf.ticket_id=?");
+    $followers->execute([$ticket_id]);
+    foreach($followers->fetchAll(PDO::FETCH_COLUMN) as $email) { $recipients[$email] = 'follower'; }
+
+    // Requester
+    if (!empty($ticket_data['requester_email'])) { $recipients[$ticket_data['requester_email']] = 'requester'; }
+    
+    // Agent
+    $agent_email = null;
+    if (!empty($ticket_data['agent_id'])) {
+        $st_agent = $pdo->prepare("SELECT email FROM users WHERE id=?");
+        $st_agent->execute([$ticket_data['agent_id']]);
+        $agent_email = $st_agent->fetchColumn();
+        if ($agent_email) { $recipients[$agent_email] = 'agent'; }
+    }
+
+    // CC Emails (comma-separated list stored as string)
+    if (!empty($ticket_data['cc_emails'])) {
+        $cc_list = explode(',', $ticket_data['cc_emails']);
+        foreach(array_filter($cc_list) as $cc_email) {
+            if (filter_var(trim($cc_email), FILTER_VALIDATE_EMAIL)) {
+                $recipients[trim($cc_email)] = 'cc';
+            }
+        }
+    }
+    
+    $excluded_emails = array_map('strtolower', $excluded_emails);
+    $targets_zulip = []; $targets_email = [];
+    
+    foreach ($recipients as $email => $role) {
+        if (!in_array(strtolower($email), $excluded_emails)) {
+            $targets_zulip[] = $email;
+            $targets_email[] = $email;
+        }
+    }
+
+    // 2. Zulip Notification
+    $link = (defined('APP_BASE_URL')? rtrim(APP_BASE_URL,'/') : '').'/tickets.php#t'.$ticket_id;
+    $zulip_msg = "🎫 **[#{$ticket_data['ticket_number']}]** - *{$ticket_data['subject']}*\nStatus: `{$ticket_data['status']}`\n\n{$message_body_raw}\n\n[Open in Dashboard]($link)";
+    
+    foreach (array_unique($targets_zulip) as $email) {
+        // zulip_send_pm is assumed to be available in the global scope of the caller
+        @zulip_send_pm($email, $zulip_msg);
+    }
+
+    // 3. Email Notification
+    $tpl = get_email_template($pdo, $event_type, $ticket_data);
+    if ($tpl) {
+        $queue_email = null;
+        if (!empty($ticket_data['queue'])) {
+            $st_q = $pdo->prepare("SELECT email FROM queue_emails WHERE queue=?");
+            $st_q->execute([$ticket_data['queue']]);
+            $queue_email = $st_q->fetchColumn();
+        }
+
+        foreach (array_unique($targets_email) as $email) {
+            @send_mail($email, $tpl['subject'], $tpl['body_html'], $queue_email); 
+        }
+    }
+}
+
+
 // --- Business Logic Functions ---
 
 function business_seconds_between(string $from, string $to): int {
