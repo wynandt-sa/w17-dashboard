@@ -70,3 +70,8 @@ function require_admin(): void {
 function e(string $s): string {
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
+
+// DEFINITIVE FIX: Define h() as a global alias for e()
+function h(string $s): string {
+    return e($s);
+}

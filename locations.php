@@ -1,5 +1,5 @@
 <?php
-// locations.php — card view for all locations; admin-only create/edit (with 4-digit phone_ext)
+// locations.php — Core Location Management Portal
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/auth.php';
 
@@ -10,7 +10,7 @@ $me = user();
 if (!$me) { header('Location: login.php'); exit; }
 $is_admin = ($me['role'] ?? '') === 'admin';
 
-// NOTE: We rely on the 'e' function defined in auth.php/header.php for escaping.
+// NOTE: Relying on auth.php for function e() and h().
 
 /* ---------------- CSRF ---------------- */
 if (empty($_SESSION['csrf'])) {
@@ -128,21 +128,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 
   // --- Location CRUD ---
-  $is_create = isset($_POST['create']);
-  $is_update = isset($_POST['update']);
   if ($is_create || $is_update) {
     $id       = (int)($_POST['id'] ?? 0);
     $code     = first($_POST,'code');
     $name     = first($_POST,'name');
-    $regionId = (int)first($_POST,'region_id') ?: null;
-    $birth    = date_or_null(first($_POST,'birthdate'));
-    $address  = first($_POST,'address');
-    $manager  = first($_POST,'manager');
-    $phone    = phone_or_null(first($_POST,'phone'));
-    $phoneExt = phone_ext_or_null(first($_POST,'phone_ext'));
-    $email    = email_or_null(first($_POST,'email'));
-    $active   = isset($_POST['active']) ? 1 : 0;
     
+    // **Defensive PHP 8.x variable assignment**
+    $region_id_raw = first($_POST,'region_id');
+    $regionId = (int)$region_id_raw ?: null;
+    
+    $birth_raw = first($_POST,'birthdate');
+    $birth    = date_or_null($birth_raw);
+    
+    $address  = first($_POST,'address');
+    $manager_raw = first($_POST,'manager');
+    $manager  = $manager_raw === '' ? null : (int)$manager_raw;
+
+    $phone_raw = first($_POST,'phone');
+    $phone    = phone_or_null($phone_raw);
+
+    $phone_ext_raw = first($_POST,'phone_ext');
+    $phoneExt = phone_ext_or_null($phone_ext_raw);
+
+    $email_raw = first($_POST,'email');
+    $email    = email_or_null($email_raw); // Can return string or null or FALSE
+    
+    $active   = isset($_POST['active']) ? 1 : 0;
+    // End FIX
+
     // Custom field values (will be processed after main location save)
     $custom_values = $_POST['custom_field'] ?? [];
 
@@ -151,7 +164,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($email === false) $form_errors[] = 'Invalid email address.';
     if ($birth === false) $form_errors[] = 'Invalid birthdate (use YYYY-MM-DD).';
     if ($phoneExt === false) $form_errors[] = 'Phone extension must be exactly 4 digits.';
-    if ($manager !== '' && !ctype_digit($manager)) $form_errors[] = 'Invalid manager.';
+    if ($manager !== null && !ctype_digit((string)$manager_raw)) $form_errors[] = 'Invalid manager.';
 
     if ($is_update && $id <= 0) $form_errors[] = 'Invalid location ID.';
 
@@ -168,15 +181,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if (!$form_errors) {
+        // Final values for DB insert/update
+        $db_birth = ($birth === false) ? null : $birth;
+        $db_phone_ext = ($phoneExt === false) ? null : $phoneExt;
+        $db_email = ($email === false) ? null : $email;
+
+
         if ($is_create) {
             $stmt = $pdo->prepare("INSERT INTO locations
               (code, name, region_id, birthdate, address, manager, phone, phone_ext, email, active)
               VALUES (:code, :name, :region_id, :birthdate, :addr, :mgr, :phone, :phone_ext, :email, :active)");
             $stmt->execute([
-              ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId, ':birthdate'=>($birth === false ? null : $birth),
-              ':addr'=>($address === '' ? null : $address), ':mgr'=>($manager === '' ? null : (int)$manager),
-              ':phone'=>$phone, ':phone_ext'=>($phoneExt === false ? null : $phoneExt),
-              ':email'=>($email === null ? null : $email), ':active'=>$active
+              ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId, ':birthdate'=>$db_birth,
+              ':addr'=>($address === '' ? null : $address), ':mgr'=>$manager,
+              ':phone'=>$phone, ':phone_ext'=>$db_phone_ext,
+              ':email'=>$db_email, ':active'=>$active
             ]);
             $id = (int)$pdo->lastInsertId();
         } else {
@@ -185,10 +204,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     manager=:mgr, phone=:phone, phone_ext=:phone_ext, email=:email, active=:active
                 WHERE id=:id");
             $stmt->execute([
-              ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId, ':birthdate'=>($birth === false ? null : $birth),
-              ':addr'=>($address === '' ? null : $address), ':mgr'=>($manager === '' ? null : (int)$manager),
-              ':phone'=>$phone, ':phone_ext'=>($phoneExt === false ? null : $phoneExt),
-              ':email'=>($email === null ? null : $email), ':active'=>$active, ':id'=>$id
+              ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId, ':birthdate'=>$db_birth,
+              ':addr'=>($address === '' ? null : $address), ':mgr'=>$manager,
+              ':phone'=>$phone, ':phone_ext'=>$db_phone_ext,
+              ':email'=>$db_email, ':active'=>$active, ':id'=>$id
             ]);
         }
         
@@ -291,7 +310,7 @@ include __DIR__ . '/partials/header.php';
         <h4 style="border-bottom:1px solid #e5e7eb; padding-bottom:.5rem; margin-bottom:.75rem">📍 <?= e($region_name) ?> (<?= count($locs) ?>)</h4>
         <div class="loc-grid">
           <?php foreach ($locs as $l): ?>
-            <div class="loc-card row-openable" onclick="openLocationModal(<?= e(json_encode($l), false) ?>)">
+            <div class="loc-card row-openable" data-id="<?= (int)$l['id'] ?>">
               <div class="loc-head">
                 <div class="loc-code"><?= e($l['code']) ?></div>
                 <div class="loc-status <?= $l['active'] ? 'on' : 'off' ?>"><?= $l['active'] ? 'Active' : 'Inactive' ?></div>
@@ -307,7 +326,7 @@ include __DIR__ . '/partials/header.php';
               
               <?php if ($is_admin): ?>
               <div class="loc-actions">
-                <button type="button" class="btn btn-light btn-sm btn-edit" data-id="<?= (int)$l['id'] ?>" onclick="event.stopPropagation(); openEditModal(<?= (int)$l['id'] ?>)">Edit</button>
+                <button type="button" class="btn btn-light btn-sm btn-edit" data-id="<?= (int)$l['id'] ?>">Edit</button>
               </div>
               <?php endif; ?>
             </div>
@@ -387,8 +406,8 @@ include __DIR__ . '/partials/header.php';
               <label><?= e($cf['name']) ?></label>
               <?php if ($cf['field_type'] === 'textarea'): ?>
                 <textarea class="input" name="<?= $key ?>" rows="3"><?= e($val) ?></textarea>
-              <?php else: ?>
-                <input class="input" name="<?= $key ?>" type="<?= e($cf['field_type']) ?>" value="<?= e($val) ?>">
+              <? else: ?>
+                <input class="input" name="<?= $key ?>" type="<?= e($cf['field_type']) ?>" value="<?= $pv('custom_field['.(int)$cf['id'].']', $val) ?>">
               <?php endif; ?>
             </div>
           <?php endforeach; ?>
@@ -594,14 +613,21 @@ include __DIR__ . '/partials/header.php';
 
 <script>
 // JSON data of all locations for the Edit modal lookup
-window.ALL_LOCATIONS = <?= json_encode($locations, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
-window.CUSTOM_FIELDS = <?= json_encode($custom_fields, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
+window.ALL_LOCATIONS = <?= json_encode($locations, JSON_UNESCAPED_UNICODE | JSON_HEX_AMP | JSON_HEX_APOS) ?>;
+window.CUSTOM_FIELDS = <?= json_encode($custom_fields, JSON_UNESCAPED_UNICODE | JSON_HEX_AMP | JSON_HEX_APOS) ?>;
 
-// NEW: Open Location Detail Modal
-function openLocationModal(l){
-    // Build content dynamically
+// Function to open the detail modal using the ID
+function openLocationModal(id){
+    const l = window.ALL_LOCATIONS.find(loc => String(loc.id) === String(id));
+    if (!l) {
+        console.warn(`[Locations] Detail: ID ${id} not found in global data.`);
+        return;
+    }
+    console.log(`[Locations] Action: Opening Detail Modal for ID: ${id}`);
+
+
     const content = document.getElementById('ld_content');
-    const isActive = l.active == 1; // Robust check for active status
+    const isActive = l.active == 1; 
     const statusText = isActive ? 'Active' : 'Inactive';
     
     let html = `
@@ -616,33 +642,33 @@ function openLocationModal(l){
         <p><strong>Status:</strong> ${statusText}</p>
     `;
 
-    // Add custom fields
     if (window.CUSTOM_FIELDS.length > 0) {
         html += '<h4 style="margin-top:1rem;border-top:1px solid #eee;padding-top:.5rem;">Custom Details</h4>';
         window.CUSTOM_FIELDS.forEach(cf => {
-            const val = l.custom_fields[cf.id] || '—';
+            const val = l.custom_fields[cf.id] || '—'; 
             html += `<p><strong>${cf.name}:</strong> ${val}</p>`;
         });
     }
 
     content.innerHTML = html;
     document.getElementById('ld_name').textContent = l.name;
-    window.openModal('location-detail'); // Correct base modal name
+    window.openModal('location-detail');
 }
 
-// Wire up "Edit" buttons (fill modal and open)
+// Function to open the edit modal using the ID
 function openEditModal(id) {
-    const l = window.ALL_LOCATIONS.find(loc => loc.id === id);
-    if (!l) return; // Exit if location not found
+    const l = window.ALL_LOCATIONS.find(loc => String(loc.id) === String(id));
+    if (!l) {
+        console.warn(`[Locations] Edit: ID ${id} not found in global data.`);
+        return;
+    }
+    console.log(`[Locations] Action: Opening Edit Modal for ID: ${id}`);
+
     
     try {
-        // Helper for safe date to <input type="date">
         function safeDate(v){ return /^\d{4}-\d{2}-\d{2}$/.test((v||'')) ? v : ''; }
-        
-        // Helper for setting value on an element safely
         function trySetVal(id, value) {
             const el = document.getElementById(id);
-            // This handles inputs and selects, ensures null values are treated as empty string
             if (el) el.value = value || '';
         }
 
@@ -671,13 +697,12 @@ function openEditModal(id) {
         
         trySetVal('e_region_id', l.region_id);
         
-        // --- 3. Custom Fields population ---
+        // --- 3. Custom Fields population (FIXED TypeError) ---
         window.CUSTOM_FIELDS.forEach(cf => {
             const input = document.querySelector(`#modal-edit [data-cf-id="${cf.id}"]`);
             if (input) {
-                const value = l.custom_fields[cf.id] || '';
+                const value = l.custom_fields[cf.id] || ''; 
                 
-                // Set value based on input type
                 if (input.tagName === 'TEXTAREA') {
                     input.value = value;
                 } else if (input.type === 'checkbox') {
@@ -688,20 +713,45 @@ function openEditModal(id) {
             }
         });
         
-        window.openModal('edit'); // Final call to open the modal
+        window.openModal('edit'); 
 
     } catch (e) {
-        // Log error to console 
-        console.error("Fatal error during modal preparation:", e);
-        // We know the Fatal Error is resolved in PHP. If JS fails here, the page will load, 
-        // but the modal won't appear.
+        console.error("Error opening edit modal:", e);
+        // CRITICAL FIX: Log the error detail and then exit
+        console.error("Error Detail:", e.message, "at", e.stack);
     }
 }
 
+// **FIX: Use Delegated Event Listener for all card interactions.**
+document.addEventListener('DOMContentLoaded', function() {
+    document.body.addEventListener('click', function(e) {
+        let card = e.target.closest('.loc-card');
+        
+        if (card) {
+            const id = parseInt(card.getAttribute('data-id'));
+            
+            // Critical Diagnostic Logging
+            console.log('Click Registered on Card ID:', id);
+
+            // 1. Check for the Edit button click (needs event stop)
+            let editButton = e.target.closest('.btn-edit');
+            if (editButton) {
+                e.stopPropagation(); 
+                openEditModal(id);
+                return; 
+            }
+            
+            // 2. Default action: Open detail modal
+            openLocationModal(id);
+        }
+    });
+});
+
+
 (function(){
   // Deep-link support after validation bounce
-  if (location.hash === '#modal-create') window.openModal('create'); // Correct base modal name
-  if (location.hash === '#modal-edit')   window.openModal('edit'); // Correct base modal name
+  if (location.hash === '#modal-create') window.openModal('create'); 
+  if (location.hash === '#modal-edit')   window.openModal('edit'); 
 })();
 </script>
 

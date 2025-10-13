@@ -1,14 +1,17 @@
 <?php
 // orgchart.php — centered organogram (2nd tier auto-expanded, clean avatars, no search)
 require_once __DIR__ . '/db.php';
-require_once __DIR__ . '/auth.php';
-
+require_once __DIR__ . '/auth.php'; // auth.php now defines h() globally
 
 if (session_status() !== PHP_SESSION_ACTIVE) session_start();
 $pdo = db();
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
-function h($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+// **FIX: Conditionally define h() to prevent "Cannot redeclare function h()" fatal error.**
+if (!function_exists('h')) {
+  function h($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+}
+
 
 /* Fetch ACTIVE users */
 $rows = $pdo->query("
@@ -60,7 +63,6 @@ $payload=['nodes'=>$nodes,'tree'=>$tree,'roots'=>$roots];
 
 include __DIR__ . '/partials/header.php';
 ?>
-<!-- Full-width shell that respects the page layout (no overlay, no fixed pos) -->
 <div class="oc-shell">
   <div class="oc-head">
     <h3>Organisational Structure</h3>

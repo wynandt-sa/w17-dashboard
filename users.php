@@ -11,7 +11,11 @@ $my_id = (int)$me['id'];
 $is_admin = is_admin();
 $is_manager = is_manager(); // True if admin OR dynamically assigned manager role
 
+// **FIX**: The file relies on e() from auth.php. Define h() conditionally to fix the Fatal Error.
 if (!function_exists('e')) { function e($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); } }
+if (!function_exists('h')) {
+  function h($v){ if (!function_exists('e')) return ''; return e($v); }
+}
 
 // --- Determine view/edit mode ---
 $view_id = (int)($_GET['id'] ?? 0);

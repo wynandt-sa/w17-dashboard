@@ -3,7 +3,7 @@ require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/auth.php';
 require_login();
 
-if (!function_exists('e')) { function e($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); } }
+// NOTE: Relying entirely on auth.php for functions e() and h() to prevent redeclaration errors.
 
 $pdo = db();
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
@@ -241,7 +241,7 @@ function compute_next_run(array $t, DateTime $from=null): ?DateTime {
   if ($type === 'weekly' || $type === 'biweekly') {
     $by = array_filter(array_map('trim', explode(',', (string)$t['byday'])));
     if (!$by) $by = ['MO'];
-    $map = ['Mon'=>'MO','Tue'=>'TU','Wed'=>'WE','THU'=>'TH','Fri'=>'FR','Sat'=>'SA','Sun'=>'SU'];
+    $map = ['Mon'=>'MO','Tue'=>'TU','Wed'=>'WE','THU'=>'TH','Fri'=>'FR','SA'=>'SA','SU'=>'SU'];
     $d = clone $now; $d->setTime(8,0,0);
     $wkStart = (int)$start->format('W');
     for ($i=0; $i<60; $i++) {
@@ -487,8 +487,24 @@ if ($_SERVER['REQUEST_METHOD']==='POST') {
             'created_by'    => $manager_id ?? null, // Task creator remains ticket creator
             'assignee_id'   => (int)$uid,          // Task assignee becomes ticket agent
           ]);
-          $pdo->prepare("INSERT INTO scheduled_task_run_tickets (run_id,ticket_id,assignee_id) VALUES (?,?,?)")->execute([$run_id,$tid,$uid]);
+          
+          // 1. Insert RTT record (Link Ticket to Run)
+          $st_rtt = $pdo->prepare("INSERT INTO scheduled_task_run_tickets (run_id,ticket_id,assignee_id) VALUES (?,?,?)");
+          $st_rtt->execute([$run_id,$tid,$uid]);
+          $rtt_id = (int)$pdo->lastInsertId();
 
+          // 2. **FIX**: Insert corresponding entry into the 'tasks' table, linked by RTT ID.
+          $st_task = $pdo->prepare("INSERT INTO tasks (title, description, assignee, due_date, created_by, scheduled_task_run_ticket_id) 
+                                      VALUES (?, ?, ?, ?, ?, ?)");
+          $st_task->execute([
+              $subject, 
+              'Task for Ticket '.$tid.': '.strip_tags($body), // Use a simplified description
+              $uid, 
+              date('Y-m-d', strtotime('+7 days')), // Use a default due date
+              $manager_id ?? null,
+              $rtt_id
+          ]);
+          
           // Checklist item insertion (REQUIRED FOR TASK CHECKLIST)
           $ins_checklist = $pdo->prepare("INSERT INTO task_run_checklist (ticket_id, item_index) VALUES (?,?)");
           foreach($items as $idx => $it) {
@@ -1016,7 +1032,7 @@ onTypeChange();
 ?>
 window.TEMPLATES = <?= json_encode($tplForJs, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
 window.SIMPLE_TASKS = <?= json_encode($simpleTasksForJs, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
-window.SCHEDULED    = <?= json_encode($scheduledForJs,     JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
+window.SCHEDULED = <?= json_encode($scheduledForJs,     JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
 
 /* Template modal controls */
 function openTemplateModalCreate(){
@@ -1178,6 +1194,8 @@ function openScheduledEdit(id){
 (function(){
   const btns = Array.from(document.querySelectorAll('button[onclick="openModal(\'simple\')"]'));
   btns.forEach(btn => btn.addEventListener('click', function(){
+    const h = document.querySelector('#modal-simple .modal-h h3');
+    if (h) h.textContent = 'New Task';
     document.getElementById('simple_id').value = '';
     document.querySelector('#modal-simple input[name="title"]').value = '';
     document.querySelector('#modal-simple textarea[name="description"]').value = '';
@@ -1186,7 +1204,6 @@ function openScheduledEdit(id){
     if (sel && sel.options.length) sel.selectedIndex = 0;
     document.getElementById('btn-simple-create').style.display = 'inline-block';
     document.getElementById('btn-simple-update').style.display = 'none';
-    const h = document.querySelector('#modal-simple .modal-h h3'); if (h) h.textContent = 'New Task';
   }));
 })();
 </script>
