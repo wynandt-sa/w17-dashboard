@@ -1,628 +1,361 @@
 <?php
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/auth.php';
-require_login(); 
+require_admin();
 
+/* session + csrf */
+if (!function_exists('session_status') || session_status() !== PHP_SESSION_ACTIVE) {
+  if (session_id() === '') { session_start(); }
+}
+if (empty($_SESSION['csrf'])) { $_SESSION['csrf'] = bin2hex(openssl_random_pseudo_bytes(32)); }
+
+/* db */
 $pdo = db();
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 
-$me = user();
-$my_id = (int)$me['id'];
-$is_admin = is_admin();
-$is_manager = is_manager(); // True if admin OR dynamically assigned manager role
+/* helpers: detect live columns safely */
+function table_cols(PDO $pdo, $table){
+  static $cache = [];
+  if (isset($cache[$table])) return $cache[$table];
+  $cols = [];
+  try {
+    $st = $pdo->query("SHOW COLUMNS FROM `{$table}`");
+    foreach ($st as $r) { $cols[$r['Field']] = true; }
+  } catch (Exception $e) { $cols = []; }
+  return $cache[$table] = $cols;
+}
+$UC = table_cols($pdo,'users');
 
-// **FIX**: The file relies on e() from auth.php. Define h() conditionally to fix the Fatal Error.
-if (!function_exists('e')) { function e($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); } }
-if (!function_exists('h')) {
-  function h($v){ if (!function_exists('e')) return ''; return e($v); }
+/* build a display name expr that always exists */
+function user_display_name_sql($alias, $UC){
+  if (isset($UC['name'])) return "{$alias}.name";
+  $parts = [];
+  if (isset($UC['first_name'])) $parts[] = "COALESCE({$alias}.first_name,'')";
+  if (isset($UC['last_name']))  $parts[] = "COALESCE({$alias}.last_name,'')";
+  if ($parts) return "TRIM(CONCAT(" . implode(", ' ', ", $parts) . "))";
+  if (isset($UC['email'])) return "{$alias}.email";
+  return "''";
 }
 
-// --- Determine view/edit mode ---
-$view_id = (int)($_GET['id'] ?? 0);
-$is_list_view = $view_id === 0;
+/* split "Name" into first/last if needed */
+function split_name($name){
+  $name = trim((string)$name);
+  if ($name === '') return ['',''];
+  $parts = preg_split('/\s+/', $name);
+  $first = array_shift($parts);
+  $last  = trim(implode(' ', $parts));
+  return [$first, $last];
+}
 
-if (!$is_list_view && $view_id !== $my_id) {
-    // Not viewing own profile. Must be Admin or Manager of target user.
-    if (!$is_admin) {
-        // Check if I am the manager of the target user
-        $st_mgr = $pdo->prepare("SELECT manager_id FROM users WHERE id = ? AND manager_id = ? AND active=1");
-        $st_mgr->execute([$view_id, $my_id]);
-        if (!$st_mgr->fetchColumn()) {
-            http_response_code(403); exit('Access denied.');
+/* ---------- JSON API ---------- */
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_GET['api'])) {
+  header('Content-Type: application/json');
+  $in = json_decode(file_get_contents('php://input'), true);
+  if (!is_array($in)) $in = [];
+  if (!isset($_SESSION['csrf']) || ($in['csrf'] ?? '') !== $_SESSION['csrf']) {
+    http_response_code(400); echo json_encode(['ok'=>false,'error'=>'CSRF']); exit;
+  }
+
+  $api = $_GET['api'];
+
+  if ($api === 'get') {
+    $id = (int)($in['id'] ?? 0);
+    if ($id<=0){ echo json_encode(['ok'=>false,'error'=>'Invalid id']); exit; }
+
+    // select columns that exist
+    $fields = ['id'];
+    foreach (['email','role','phone','mobile','manager_id','active'] as $f) if (isset($UC[$f])) $fields[] = $f;
+
+    $sql = "SELECT ".implode(',', array_map(function($f){return "u.$f";}, $fields))." , "
+         . user_display_name_sql('u', $UC) . " AS __display_name "
+         . "FROM users u WHERE u.id=?";
+    $st = $pdo->prepare($sql); $st->execute([$id]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+
+    if ($row && !isset($UC['name'])) {
+      // return "name" virtual for the form
+      $row['name'] = $row['__display_name'];
+    }
+    unset($row['__display_name']);
+
+    echo json_encode(['ok'=>true,'user'=>$row]); exit;
+  }
+
+  if ($api === 'save') {
+    $id = (int)($in['id'] ?? 0);
+
+    // prepare columns and values that exist
+    $set = []; $vals = [];
+
+    // name handling
+    if (isset($in['name'])) {
+      $name = trim((string)$in['name']);
+      if (isset($UC['name'])) {
+        $set[] = "name=?"; $vals[] = $name;
+      } else {
+        list($first,$last) = split_name($name);
+        if (isset($UC['first_name'])) { $set[]="first_name=?"; $vals[]=$first; }
+        if (isset($UC['last_name']))  { $set[]="last_name=?";  $vals[]=$last;  }
+      }
+    }
+
+    // other optional fields
+    $map = ['email','role','phone','mobile'];
+    foreach ($map as $f) {
+      if (isset($UC[$f]) && isset($in[$f])) { $set[]="$f=?"; $vals[] = trim((string)$in[$f]); }
+    }
+    if (isset($UC['manager_id']) && array_key_exists('manager_id',$in)) {
+      $set[]="manager_id=?"; $vals[] = ($in['manager_id'] === '' ? null : (int)$in['manager_id']);
+    }
+    if (isset($UC['active']) && array_key_exists('active',$in)) {
+      $set[]="active=?"; $vals[] = !empty($in['active']) ? 1 : 0;
+    }
+
+    try {
+      if ($id>0) {
+        if ($set) {
+          $sql="UPDATE users u SET ".implode(',', $set)." WHERE u.id=?";
+          $vals[]=$id;
+          $st=$pdo->prepare($sql); $st->execute($vals);
         }
+      } else {
+        $cols=[]; $qs=[]; $ins=[];
+        foreach ($set as $k=>$assign){
+          list($col,) = explode('=', $assign, 2);
+          $cols[] = trim($col); $qs[]='?'; $ins[] = $vals[$k];
+        }
+        if (isset($UC['password_hash'])) { $cols[]='password_hash'; $qs[]='SHA2(CONCAT(UUID(),RAND()),256)'; }
+        if (isset($UC['created_at']))    { $cols[]='created_at';    $qs[]='NOW()'; }
+        if ($cols) {
+          $sql = "INSERT INTO users (".implode(',',$cols).") VALUES (".implode(',',$qs).")";
+          $st=$pdo->prepare($sql); $st->execute($ins);
+        }
+      }
+      echo json_encode(['ok'=>true]);
+    } catch (Exception $e) {
+      http_response_code(500); echo json_encode(['ok'=>false,'error'=>'DB error']);
     }
-} elseif ($is_list_view && !$is_admin) {
-     // Only Admins can see the list view. Others are redirected to their profile.
-     header("Location: users.php?id={$my_id}"); exit;
-}
-
-/* ---------- CSRF ---------- */
-if (session_status() !== PHP_SESSION_ACTIVE) session_start();
-if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
-function csrf_input(){ echo '<input type="hidden" name="csrf" value="'.e($_SESSION['csrf']).'">'; }
-function csrf_check(){
-  if (empty($_POST['csrf']) || empty($_SESSION['csrf']) || !hash_equals($_SESSION['csrf'], $_POST['csrf'])) {
-    http_response_code(400); exit('Invalid CSRF');
-  }
-}
-
-/* ---------- Helpers / schema ---------- */
-function col_exists(PDO $pdo, $table, $col){
-  $s=$pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1");
-  $s->execute([$table,$col]); return (bool)$s->fetchColumn();
-}
-
-// Ensure 'phone' column exists (User profile requirement)
-if (!col_exists($pdo, 'users', 'phone')) {
-    try {
-        $pdo->exec("ALTER TABLE users ADD COLUMN phone VARCHAR(50) NULL");
-    } catch (Throwable $e) {}
-}
-
-$QUEUE_VALUES = ['Workshop17','HR','Finance'];
-
-$pdo->exec("
-CREATE TABLE IF NOT EXISTS user_queue_access (
-  user_id INT NOT NULL,
-  queue ENUM('Workshop17','HR','Finance') NOT NULL,
-  PRIMARY KEY (user_id, queue),
-  CONSTRAINT fk_uqa_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-");
-
-/* Detect password column gracefully */
-$PASSWORD_COL = null;
-if (col_exists($pdo,'users','password_hash')) $PASSWORD_COL = 'password_hash';
-elseif (col_exists($pdo,'users','password'))  $PASSWORD_COL = 'password';
-
-/* ---------- POST: create / update / delete ---------- */
-$msg = null; $err = null;
-
-if ($_SERVER['REQUEST_METHOD']==='POST') {
-  csrf_check();
-
-  /* CREATE (Admin only) */
-  if ($is_admin && isset($_POST['create'])) {
-    try {
-      $first = trim($_POST['first_name'] ?? '');
-      $last  = trim($_POST['last_name'] ?? '');
-      $email = trim($_POST['email'] ?? '');
-      $usern = trim($_POST['username'] ?? '');
-      $role  = ($_POST['role'] ?? 'user') === 'admin' ? 'admin' : 'user';
-      $active= isset($_POST['active']) ? 1 : 0;
-      $dob   = $_POST['date_of_birth'] ?: null;
-      $anniv = $_POST['work_anniversary'] ?: null;
-      $dept  = trim($_POST['department'] ?? '');
-      $job   = trim($_POST['job_title'] ?? '');
-      $mgr   = (int)($_POST['manager_id'] ?? 0) ?: null;
-      $loc   = (int)($_POST['location_id'] ?? 0) ?: null;
-      $pwd   = trim($_POST['password'] ?? '');
-      $phone = trim($_POST['phone'] ?? '');
-
-      if ($first==='' || $last==='' || $email==='' || $usern==='') {
-        throw new RuntimeException('Please complete all required fields.');
-      }
-      if ($PASSWORD_COL && $pwd==='') { throw new RuntimeException('Please set an initial password.'); }
-
-      $cols = ['first_name','last_name','email','username','role','active','date_of_birth','work_anniversary','department','job_title','manager_id','location_id','phone'];
-      $vals = [$first,$last,$email,$usern,$role,$active,$dob,$anniv,$dept,$job,$mgr,$loc,$phone];
-
-      if ($PASSWORD_COL && $pwd!=='') {
-        $cols[] = $PASSWORD_COL;
-        $vals[] = password_hash($pwd, PASSWORD_DEFAULT);
-      }
-
-      $place = implode(',', array_fill(0,count($cols),'?'));
-      $sql = "INSERT INTO users (".implode(',',$cols).") VALUES ($place)";
-      $pdo->prepare($sql)->execute($vals);
-      $uid = (int)$pdo->lastInsertId();
-
-      // queues
-      $sel = array_values(array_intersect($QUEUE_VALUES, (array)($_POST['queues'] ?? [])));
-      if ($sel) {
-        $ins = $pdo->prepare("INSERT INTO user_queue_access (user_id,queue) VALUES (?,?)");
-        foreach ($sel as $q) $ins->execute([$uid,$q]);
-      }
-      $msg = 'created';
-      header('Location: users.php?msg='.$msg); exit;
-
-    } catch (Throwable $ex) {
-      $err = $ex->getMessage();
-      if (stripos($err, 'duplicate') !== false || stripos($err, 'unique') !== false) {
-        $err = 'Username or email already exists.';
-      }
-    }
+    exit;
   }
 
-  /* UPDATE (Self, Manager of subordinate, or Admin) */
-  if (isset($_POST['save'])) {
-    try {
-      $id    = (int)($_POST['id'] ?? 0);
-      $is_target_subordinate = false;
-
-      // Authorization Check
-      if ($id <= 0) throw new RuntimeException('Invalid user ID.');
-      if ($id !== $my_id && !$is_admin) {
-          // If not self and not admin, must be manager of $id
-          $st_mgr = $pdo->prepare("SELECT manager_id FROM users WHERE id = ? AND manager_id = ? AND active=1");
-          $st_mgr->execute([$id, $my_id]);
-          if (!$st_mgr->fetchColumn()) {
-              http_response_code(403); exit('Access denied to modify this user.');
-          }
-          $is_target_subordinate = true;
-      }
-      
-      $first = trim($_POST['first_name'] ?? '');
-      $last  = trim($_POST['last_name'] ?? '');
-      $dob   = $_POST['date_of_birth'] ?: null;
-      $anniv = $_POST['work_anniversary'] ?: null;
-      $dept  = trim($_POST['department'] ?? '');
-      $job   = trim($_POST['job_title'] ?? '');
-      $phone = trim($_POST['phone'] ?? '');
-      $pwd   = trim($_POST['password'] ?? '');
-
-      if ($first==='' || $last==='') {
-        throw new RuntimeException('Please complete all required fields (Name).');
-      }
-
-      // 1. Get current values for protected fields if not admin
-      $st_old = $pdo->prepare("SELECT email, username, role, active, manager_id, location_id FROM users WHERE id=?");
-      $st_old->execute([$id]);
-      $old_u = $st_old->fetch(PDO::FETCH_ASSOC);
-
-      // 2. Determine final values based on role (Admin takes POST, User takes existing)
-      // FIX: Admin always takes POST data for email/username, fixing the persistence bug.
-      $final_email = $is_admin ? trim($_POST['email'] ?? '') : $old_u['email'];
-      $final_usern = $is_admin ? trim($_POST['username'] ?? '') : $old_u['username'];
-      $final_role  = $is_admin ? (($_POST['role'] ?? 'user') === 'admin' ? 'admin' : 'user') : $old_u['role'];
-      $final_active= $is_admin ? (isset($_POST['active']) ? 1 : 0) : $old_u['active'];
-      $final_mgr   = $is_admin ? ((int)($_POST['manager_id'] ?? 0) ?: null) : $old_u['manager_id'];
-      $final_loc   = $is_admin ? ((int)($_POST['location_id'] ?? 0) ?: null) : $old_u['location_id'];
-      
-      // 3. Build SET clause
-      $sets = "first_name=?, last_name=?, email=?, username=?, role=?, active=?, manager_id=?, location_id=?, date_of_birth=?, work_anniversary=?, department=?, job_title=?, phone=?";
-      $args = [
-          $first, $last, $final_email, $final_usern, $final_role, $final_active, $final_mgr, $final_loc,
-          $dob, $anniv, $dept, $job, $phone
-      ];
-
-      // Password change logic
-      if ($PASSWORD_COL && $pwd!=='') {
-        $sets .= ", $PASSWORD_COL=?";
-        $args[] = password_hash($pwd, PASSWORD_DEFAULT);
-      }
-      
-      // Admin queue update logic
-      if ($is_admin) {
-          $pdo->prepare("DELETE FROM user_queue_access WHERE user_id=?")->execute([$id]);
-          $sel = array_values(array_intersect($QUEUE_VALUES, (array)($_POST['queues'] ?? [])));
-          if ($sel) {
-            $ins = $pdo->prepare("INSERT INTO user_queue_access (user_id,queue) VALUES (?,?)");
-            foreach ($sel as $q) $ins->execute([$id,$q]);
-          }
-      }
-      
-      $sets .= " WHERE id=?";
-      $args[] = $id;
-
-      $pdo->prepare("UPDATE users SET $sets")->execute($args);
-
-      $msg = 'saved';
-      header('Location: users.php?id='.$id.'&msg='.$msg); exit;
-
-    } catch (Throwable $ex) {
-      $err = $ex->getMessage();
-      if (stripos($err, 'duplicate') !== false || stripos($err, 'unique') !== false) {
-        $err = 'Username or email already exists.';
-      }
-    }
+  if ($api === 'delete') {
+    $id=(int)($in['id']??0);
+    $me = user();
+    if ($me && (int)($me['id'] ?? 0) === $id) { echo json_encode(['ok'=>false,'error'=>'Cannot delete current user']); exit; }
+    $pdo->prepare("DELETE FROM users WHERE id=?")->execute([$id]);
+    echo json_encode(['ok'=>true]); exit;
   }
 
-  /* DELETE (admin only) */
-  if ($is_admin && isset($_POST['delete'])) {
-    $id = (int)($_POST['id'] ?? 0);
-    if ($id === (int)$me['id']) { $err = "You can't delete yourself."; }
-    else {
-      $pdo->prepare("DELETE FROM users WHERE id=?")->execute([$id]);
-      $msg = 'deleted';
-      header('Location: users.php?msg='.$msg); exit;
-    }
-  }
+  echo json_encode(['ok'=>false]); exit;
 }
 
-/* ---------- Data ---------- */
-if ($is_list_view) {
-    // Admin list view
-    $users = $pdo->query("SELECT u.*, CONCAT_WS(' ',m.first_name,m.last_name) AS manager_name
-                          FROM users u LEFT JOIN users m ON m.id=u.manager_id
-                          ORDER BY u.first_name,u.last_name")->fetchAll(PDO::FETCH_ASSOC);
+/* ---------- Page ---------- */
+$nameExpr = user_display_name_sql('u', $UC) . " AS display_name";
+$select = ["u.id", $nameExpr];
+if (isset($UC['email']))  $select[]='u.email';
+if (isset($UC['role']))   $select[]='u.role';
+if (isset($UC['phone']))  $select[]='u.phone';
+if (isset($UC['mobile'])) $select[]='u.mobile';
+if (isset($UC['active'])) $select[]='u.active';
 
-    $managers = $pdo->query("SELECT id, CONCAT_WS(' ',first_name,last_name) AS name FROM users ORDER BY first_name,last_name")->fetchAll(PDO::FETCH_KEY_PAIR);
-    $queuesByUser = $pdo->query("SELECT user_id, GROUP_CONCAT(queue ORDER BY queue) AS qs FROM user_queue_access GROUP BY user_id")->fetchAll(PDO::FETCH_KEY_PAIR);
+$joinMgr = isset($UC['manager_id']);
+if ($joinMgr) { $select[]="COALESCE(m.name, m.email, '') AS manager_name"; $select[]='u.manager_id'; }
 
-    /* Locations for select lists */
-    $locationsKV = [];
-    if ($pdo->query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='locations'")->fetchColumn()) {
-      $locationsKV = $pdo->query("SELECT id, name FROM locations ORDER BY code, name")->fetchAll(PDO::FETCH_KEY_PAIR);
-    }
+$sql="SELECT ".implode(',', $select)." FROM users u ";
+if ($joinMgr) $sql.="LEFT JOIN users m ON m.id=u.manager_id ";
+$sql.="ORDER BY display_name ASC";
+$users = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
 
-} else {
-    // Self-service/Manager profile view
-    $target_user_id = $view_id;
-    
-    $st = $pdo->prepare("SELECT u.*, CONCAT_WS(' ',m.first_name,m.last_name) AS manager_name
-                         FROM users u LEFT JOIN users m ON m.id=u.manager_id
-                         WHERE u.id = ?");
-    $st->execute([$target_user_id]);
-    $target_user = $st->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$target_user) { http_response_code(404); exit('User not found.'); }
-    
-    $st_q = $pdo->prepare("SELECT queue FROM user_queue_access WHERE user_id = ?");
-    $st_q->execute([$target_user_id]);
-    $target_user_queues = $st_q->fetchAll(PDO::FETCH_COLUMN);
+// managers for dropdown
+$managers = $pdo->query("SELECT id, ".user_display_name_sql('x',$UC)." AS name FROM users x ".(isset($UC['role'])?"WHERE x.role IN ('manager','admin')":"")." ORDER BY name ASC")->fetchAll(PDO::FETCH_ASSOC);
 
-    $users = [$target_user]; 
-    $queuesByUser = [(int)$target_user_id => implode(',', $target_user_queues)]; 
-    
-    $managers = $pdo->query("SELECT id, CONCAT_WS(' ',first_name,last_name) AS name FROM users ORDER BY first_name,last_name")->fetchAll(PDO::FETCH_KEY_PAIR);
-    $locationsKV = [];
-    if ($pdo->query("SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='locations'")->fetchColumn()) {
-      $locationsKV = $pdo->query("SELECT id, name FROM locations ORDER BY code, name")->fetchAll(PDO::FETCH_KEY_PAIR);
-    }
-}
-
-
-include __DIR__ . '/partials/header.php';
+$page_title='Users';
+$auth_page=false;
+require __DIR__ . '/partials/header.php';
 ?>
-<div class="card">
-  <div class="card-h">
-    <h3>Dashboard — <?= $is_list_view ? 'Users' : 'My Profile' ?></h3>
-    <?php if ($is_list_view): ?>
-    <div>
-      <button class="btn btn-primary" type="button" onclick="openNew()">+ New User</button>
-    </div>
-    <?php endif; ?>
+<div class="container py-4">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h4 class="mb-0">Users</h4>
+    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#userModal" data-mode="create">Add User</button>
   </div>
-  <div class="card-b">
-    <?php if(isset($_GET['msg'])): ?>
-      <?php $m = $_GET['msg']; $text = ['saved'=>'User saved','created'=>'User created','deleted'=>'User deleted'][$m] ?? e($m); ?>
-      <div class="badge badge-success" style="display:block;margin-bottom:1rem;"><?= e($text) ?></div>
-    <?php endif; ?>
 
-    <?php if ($is_list_view): ?>
-      <?php if(!$users): ?>
-        <p>No users yet.</p>
-      <?php else: ?>
-        <div class="table-wrap">
-          <table class="table" id="usersTable">
-            <thead><tr>
-              <th>Name</th><th>Username</th><th>Email</th><th>Role</th><th>Active</th><th>Queues</th>
-            </tr></thead>
-            <tbody>
-            <?php foreach($users as $u): $uid=(int)$u['id']; ?>
-              <tr class="row-openable" data-id="<?= $uid ?>" style="cursor:pointer">
-                <td><?= e(trim(($u['first_name']??'').' '.($u['last_name']??''))) ?></td>
-                <td><?= e($u['username'] ?? '') ?></td>
-                <td><?= e($u['email'] ?? '') ?></td>
-                <td><?= e($u['role'] ?? 'user') ?></td>
-                <td><?= !empty($u['active']) ? 'Yes' : 'No' ?></td>
-                <td><?= e($queuesByUser[$uid] ?? '—') ?></td>
-              </tr>
-              <tr style="display:none">
-                <td colspan="6">
-                  <span id="u<?= $uid ?>"
-                        data-json='<?= e(json_encode($u, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'
-                        data-queues='<?= e(json_encode(($queuesByUser[$uid]??'')!==''? explode(',',$queuesByUser[$uid]) : [], JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'></span>
-                </td>
-              </tr>
-            <?php endforeach; ?>
-            </tbody>
-          </table>
-        </div>
-      <?php endif; ?>
-    <?php else: // Profile view ?>
-      <p>Viewing profile for: <strong><?= e(trim(($target_user['first_name']??'').' '.($target_user['last_name']??''))) ?></strong></p>
-      <div id="u<?= $target_user_id ?>"
-           data-json='<?= e(json_encode($target_user, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'
-           data-queues='<?= e(json_encode($target_user_queues, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'></div>
-      <button class="btn btn-primary" onclick="openEdit(<?= $target_user_id ?>)">Edit Profile</button>
-    <?php endif; ?>
-  </div>
-</div>
-
-<?php if ($is_list_view): ?>
-<div id="modal-new-user" class="modal" style="display:none">
-  <div class="modal-backdrop" onclick="closeNew()"></div>
-  <div class="modal-card" style="max-width:900px">
-    <div class="modal-h"><h3>New User</h3><button class="btn btn-light btn-icon" onclick="closeNew()" aria-label="Close">✕</button></div>
-    <div class="modal-b">
-      <form method="post" class="grid grid-2">
-        <?php csrf_input(); ?>
-        <input type="hidden" name="create" value="1">
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">First Name *</label><input class="input" name="first_name" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Last Name *</label><input class="input" name="last_name" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Email *</label><input class="input" type="email" name="email" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Username *</label><input class="input" name="username" required></div>
-
-        <div>
-          <label class="label">Role</label>
-          <select name="role" class="input"><option>user</option><option>admin</option></select>
-        </div>
-        <div>
-          <label class="label">Manager</label>
-          <select name="manager_id" class="input"><option value="">—</option>
-            <?php foreach($managers as $mid=>$nm): ?><option value="<?= (int)$mid ?>"><?= e($nm) ?></option><?php endforeach; ?>
-          </select>
-        </div>
-
-        <div>
-          <label class="label">Location</label>
-          <select name="location_id" class="input">
-            <option value="">—</option>
-            <?php foreach($locationsKV as $lid=>$ln): ?>
-              <option value="<?= (int)$lid ?>"><?= e($ln) ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <div>
-          <label class="label">Phone</label>
-          <input class="input" name="phone">
-        </div>
-        <div>
-          <label class="label">Department</label>
-          <input class="input" name="department">
-        </div>
-        <div>
-          <label class="label">Job Title</label>
-          <input class="input" name="job_title">
-        </div>
-
-        <div>
-          <label class="label">Date of Birth</label>
-          <input class="input" type="date" name="date_of_birth">
-        </div>
-        <div>
-          <label class="label">Work Anniversary</label>
-          <input class="input" type="date" name="work_anniversary">
-        </div>
-
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Queue Visibility</label>
-          <div class="chipset">
-            <?php foreach($QUEUE_VALUES as $q): ?>
-              <label class="chip"><input type="checkbox" name="queues[]" value="<?= e($q) ?>"> <span><?= e($q) ?></span></label>
-            <?php endforeach; ?>
-          </div>
-          <small style="color:#666">Tick the queues this user can view.</small>
-        </div>
-
-        <?php if ($PASSWORD_COL): ?>
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Initial Password *</label>
-          <input class="input" type="password" name="password" autocomplete="new-password" required>
-        </div>
-        <?php endif; ?>
-
-        <div>
-          <label class="label">Active</label>
-          <input type="checkbox" name="active" value="1" checked>
-        </div>
-
-        <div style="grid-column:1 / -1; display:flex; gap:.5rem; flex-wrap:wrap">
-          <button class="btn btn-primary">Create User</button>
-          <button class="btn btn-light" type="button" onclick="closeNew()">Cancel</button>
-        </div>
-      </form>
+  <div class="card">
+    <div class="card-body p-0">
+      <div class="table-responsive">
+        <table class="table mb-0 align-middle">
+          <thead>
+            <tr>
+              <th>Name</th><?php if (isset($UC['email'])): ?><th>Email</th><?php endif; ?>
+              <?php if (isset($UC['role'])): ?><th>Role</th><?php endif; ?>
+              <?php if ($joinMgr): ?><th>Manager</th><?php endif; ?>
+              <?php if (isset($UC['phone'])): ?><th>Phone</th><?php endif; ?>
+              <?php if (isset($UC['mobile'])): ?><th>Mobile</th><?php endif; ?>
+              <?php if (isset($UC['active'])): ?><th>Active</th><?php endif; ?>
+              <th style="width:120px;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="usersBody">
+          <?php foreach($users as $u): ?>
+            <tr data-id="<?php echo (int)$u['id']; ?>">
+              <td><?php echo htmlspecialchars($u['display_name'] ?? '', ENT_QUOTES, 'UTF-8'); ?></td>
+              <?php if (isset($UC['email'])): ?><td><?php echo htmlspecialchars($u['email'] ?? '', ENT_QUOTES, 'UTF-8'); ?></td><?php endif; ?>
+              <?php if (isset($UC['role'])):  ?><td><?php echo htmlspecialchars($u['role'] ?? '', ENT_QUOTES, 'UTF-8'); ?></td><?php endif; ?>
+              <?php if ($joinMgr): ?><td><?php echo htmlspecialchars($u['manager_name'] ?? '', ENT_QUOTES, 'UTF-8'); ?></td><?php endif; ?>
+              <?php if (isset($UC['phone'])):  ?><td><?php echo htmlspecialchars($u['phone'] ?? '', ENT_QUOTES, 'UTF-8'); ?></td><?php endif; ?>
+              <?php if (isset($UC['mobile'])): ?><td><?php echo htmlspecialchars($u['mobile'] ?? '', ENT_QUOTES, 'UTF-8'); ?></td><?php endif; ?>
+              <?php if (isset($UC['active'])): ?><td><?php echo !empty($u['active'])?'Yes':'No'; ?></td><?php endif; ?>
+              <td>
+                <button class="btn btn-sm btn-outline-secondary me-1 btn-edit" data-bs-toggle="modal" data-bs-target="#userModal">Edit</button>
+                <button class="btn btn-sm btn-outline-danger btn-del">Delete</button>
+              </td>
+            </tr>
+          <?php endforeach; ?>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
-<?php endif; ?>
 
-
-<div id="modal-edit-user" class="modal" style="display:none">
-  <div class="modal-backdrop" onclick="closeEdit()"></div>
-  <div class="modal-card" style="max-width:900px">
-    <div class="modal-h"><h3 id="edit_dlg_title">Edit User</h3><button class="btn btn-light btn-icon" onclick="closeEdit()" aria-label="Close">✕</button></div>
-    <div class="modal-b">
-      <form method="post" class="grid grid-2" id="editForm">
-        <?php csrf_input(); ?>
-        <input type="hidden" name="save" value="1">
-        <input type="hidden" name="id" id="f_id">
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">First Name *</label><input class="input" name="first_name" id="f_first" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Last Name *</label><input class="input" name="last_name" id="f_last" required></div>
-        
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Email * <span class="field-note" id="note_email"></span></label><input class="input" type="email" name="email" id="f_email" required></div>
-        <div class="grid" style="grid-template-columns:1fr"><label class="label">Username * <span class="field-note" id="note_usern"></span></label><input class="input" name="username" id="f_usern" required></div>
-        
-        <div id="field_role" class="field_admin">
-          <label class="label">Role</label>
-          <select name="role" id="f_role" class="input"><option>user</option><option>admin</option></select>
+<!-- Modal -->
+<div class="modal fade" id="userModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <form id="userForm" class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">User</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" name="csrf" value="<?php echo $_SESSION['csrf']; ?>">
+        <input type="hidden" id="u_id">
+        <div class="mb-3">
+          <label class="form-label">Name</label>
+          <input class="form-control" id="u_name" required>
         </div>
-        <div id="field_mgr" class="field_admin">
-          <label class="label">Manager</label>
-          <select name="manager_id" id="f_mgr" class="input"><option value="">—</option>
-            <?php foreach($managers as $mid=>$nm): ?><option value="<?= (int)$mid ?>"><?= e($nm) ?></option><?php endforeach; ?>
-          </select>
-        </div>
-
-        <div id="field_loc" class="field_admin">
-          <label class="label">Location</label>
-          <select name="location_id" id="f_loc" class="input">
-            <option value="">—</option>
-            <?php foreach($locationsKV as $lid=>$ln): ?>
-              <option value="<?= (int)$lid ?>"><?= e($ln) ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Phone</label>
-          <input class="input" name="phone" id="f_phone">
-        </div>
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Department</label>
-          <input class="input" name="department" id="f_dept">
-        </div>
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Job Title</label>
-          <input class="input" name="job_title" id="f_job">
-        </div>
-
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Date of Birth</label>
-          <input class="input" type="date" name="date_of_birth" id="f_dob">
-        </div>
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">Work Anniversary</label>
-          <input class="input" type="date" name="work_anniversary" id="f_anniv">
-        </div>
-
-        <div class="grid field_admin" style="grid-template-columns:1fr">
-          <label class="label">Queue Visibility</label>
-          <div class="chipset">
-            <?php foreach($QUEUE_VALUES as $q): ?>
-              <label class="chip"><input type="checkbox" name="queues[]" value="<?= e($q) ?>" class="qcb"> <span><?= e($q) ?></span></label>
-            <?php endforeach; ?>
-          </div>
-        </div>
-
-        <?php if ($PASSWORD_COL): ?>
-        <div class="grid" style="grid-template-columns:1fr">
-          <label class="label">New Password (leave blank to keep)</label>
-          <input class="input" type="password" name="password" autocomplete="new-password">
+        <?php if (isset($UC['email'])): ?>
+        <div class="mb-3">
+          <label class="form-label">Email</label>
+          <input class="form-control" type="email" id="u_email" required>
         </div>
         <?php endif; ?>
-
-        <div id="field_active" class="field_admin">
-          <label class="label">Active (Admin only)</label>
-          <input type="checkbox" name="active" id="f_active" value="1">
+        <?php if (isset($UC['role'])): ?>
+        <div class="mb-3">
+          <label class="form-label">Role</label>
+          <select class="form-select" id="u_role">
+            <option value="user">user</option>
+            <option value="manager">manager</option>
+            <option value="admin">admin</option>
+          </select>
         </div>
-
-        <div style="grid-column:1 / -1; display:flex; gap:.5rem; flex-wrap:wrap">
-          <button class="btn btn-primary">Save</button>
-          <button class="btn btn-light" type="button" onclick="closeEdit()">Cancel</button>
-          <?php if ($is_admin): ?>
-          <form method="post" style="display:inline" onsubmit="return confirm('Delete this user?')">
-            <?php csrf_input(); ?>
-            <input type="hidden" name="id" id="del_id">
-            <button class="btn btn-danger" name="delete" value="1">Delete</button>
-          </form>
+        <?php endif; ?>
+        <?php if ($joinMgr): ?>
+        <div class="mb-3">
+          <label class="form-label">Manager</label>
+          <select class="form-select" id="u_manager_id">
+            <option value="">None</option>
+            <?php foreach($managers as $m): ?>
+              <option value="<?php echo (int)$m['id'];?>"><?php echo htmlspecialchars($m['name'], ENT_QUOTES, 'UTF-8'); ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <?php endif; ?>
+        <?php if (isset($UC['phone']) || isset($UC['mobile'])): ?>
+        <div class="row g-3">
+          <?php if (isset($UC['phone'])): ?>
+          <div class="col-md-6">
+            <label class="form-label">Phone</label>
+            <input class="form-control" id="u_phone">
+          </div>
+          <?php endif; ?>
+          <?php if (isset($UC['mobile'])): ?>
+          <div class="col-md-6">
+            <label class="form-label">Mobile</label>
+            <input class="form-control" id="u_mobile">
+          </div>
           <?php endif; ?>
         </div>
-      </form>
-    </div>
+        <?php endif; ?>
+        <?php if (isset($UC['active'])): ?>
+        <div class="form-check mt-3">
+          <input class="form-check-input" type="checkbox" id="u_active">
+          <label class="form-check-label" for="u_active">Active</label>
+        </div>
+        <?php endif; ?>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Close</button>
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
   </div>
 </div>
 
-<style>
-/* keep custom CSS minimal—inherit buttons/inputs from header */
-#usersTable tbody tr.row-openable:hover{ background:#f8fafb; }
-.modal{position:fixed;inset:0;z-index:60;display:flex;align-items:center;justify-content:center}
-.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.35)}
-.modal-card{position:relative;background:var(--white);border-radius:12px;box-shadow:0 10px 25px rgba(0,0,0,.15);width:min(900px,94vw);max-height:92vh;overflow:auto}
-.modal-h{display:flex;align-items:center;justify-content:space-between;padding:1rem 1.25rem;border-bottom:1px solid #e5e7eb}
-.modal-b{padding:1rem 1.25rem}
-.label{font-weight:600;margin:.25rem 0}
-.chipset{display:flex;gap:.5rem;flex-wrap:wrap}
-.chip{display:inline-flex;align-items:center;gap:.35rem;border:1px solid var(--gray-200);border-radius:999px;padding:.35rem .6rem;background:#fafbfc}
-.btn-icon{padding:.35rem .5rem}
-.field-note{font-weight:400;font-style:italic;color:var(--muted);font-size:.9em}
-</style>
 <script>
-const IS_ADMIN = <?= $is_admin ? 'true' : 'false' ?>;
-const MY_ID = <?= (int)$me['id'] ?>;
-const IS_MANAGER = <?= is_manager() ? 'true' : 'false' ?>;
-
-<?php if ($is_list_view): ?>
-/* row click opens edit */
 (function(){
-  document.querySelectorAll('#usersTable tbody tr.row-openable').forEach(tr=>{
-    tr.addEventListener('click', ()=>{
-      const id = tr.getAttribute('data-id');
-      if (id) openEdit(parseInt(id,10));
-    }, {passive:true});
+  var tbody = document.getElementById('usersBody');
+  var modalEl = document.getElementById('userModal');
+  var form = document.getElementById('userForm');
+
+  function csrf(){
+    var el = form.querySelector('input[name="csrf"]');
+    return el ? el.value : (window.CSRF || '');
+  }
+  function fill(u){
+    document.getElementById('u_id').value = u.id || '';
+    document.getElementById('u_name').value = u.name || u.display_name || '';
+    var e = document.getElementById('u_email'); if (e) e.value = u.email || '';
+    var r = document.getElementById('u_role'); if (r && u.role) r.value = u.role;
+    var m = document.getElementById('u_manager_id'); if (m) m.value = (u.manager_id != null ? u.manager_id : '');
+    var p = document.getElementById('u_phone');  if (p) p.value = u.phone || '';
+    var mb= document.getElementById('u_mobile'); if (mb) mb.value = u.mobile || '';
+    var ac= document.getElementById('u_active'); if (ac) ac.checked = !!(u.active*1 || u.active===true);
+  }
+  function api(path, payload){
+    return fetch(path, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) }).then(function(r){ return r.json(); });
+  }
+
+  var createBtn = document.querySelector('[data-bs-target="#userModal"][data-mode="create"]');
+  if (createBtn) createBtn.addEventListener('click', function(){ fill({id:'',name:'',role:'user',manager_id:'',active:1}); });
+
+  tbody.addEventListener('click', function(e){
+    var btnEdit = e.target.closest ? e.target.closest('.btn-edit') : null;
+    var btnDel  = e.target.closest ? e.target.closest('.btn-del')  : null;
+    var tr = e.target.closest ? e.target.closest('tr') : null; if (!tr) return;
+    var id = +tr.getAttribute('data-id');
+
+    if (btnEdit){
+      api('users.php?api=get', {id:id, csrf: csrf()}).then(function(data){
+        if (!data.ok) { alert(data.error||'Failed to load'); return; }
+        fill(data.user||{});
+        try { new bootstrap.Modal(modalEl).show(); } catch(_){}
+      });
+    }
+    if (btnDel){
+      if (!confirm('Delete this user?')) return;
+      api('users.php?api=delete', {id:id, csrf: csrf()}).then(function(data){
+        if (data.ok) location.reload(); else alert(data.error||'Delete failed');
+      });
+    }
+  });
+
+  form.addEventListener('submit', function(e){
+    e.preventDefault();
+    var payload = {
+      id: document.getElementById('u_id').value,
+      name: document.getElementById('u_name').value,
+      csrf: csrf()
+    };
+    var e1 = document.getElementById('u_email'); if (e1) payload.email = e1.value;
+    var r1 = document.getElementById('u_role');  if (r1) payload.role  = r1.value;
+    var m1 = document.getElementById('u_manager_id'); if (m1) payload.manager_id = m1.value;
+    var p1 = document.getElementById('u_phone'); if (p1) payload.phone = p1.value;
+    var m2 = document.getElementById('u_mobile'); if (m2) payload.mobile = m2.value;
+    var a1 = document.getElementById('u_active'); if (a1) payload.active = a1.checked ? 1 : 0;
+
+    api('users.php?api=save', payload).then(function(data){
+      if (data.ok) location.reload(); else alert(data.error||'Save failed');
+    });
   });
 })();
-<?php endif; ?>
-
-function openNew(){
-  const f = document.querySelector('#modal-new-user form');
-  f.reset();
-  window.openModal('modal-new-user');
-}
-function closeNew(){ window.closeModal('modal-new-user'); }
-
-function openEdit(id){
-  const el = document.getElementById('u'+id);
-  if(!el) return;
-  const u = JSON.parse(el.getAttribute('data-json')||'{}');
-  const qs = JSON.parse(el.getAttribute('data-queues')||'[]');
-  
-  const is_self = id === MY_ID;
-
-  // Helper for safe date to <input type="date">
-  function safeDate(v){ return /^\d{4}-\d{2}-\d{2}$/.test((v||'')) ? v : ''; }
-
-  document.getElementById('f_id').value   = u.id || '';
-  document.getElementById('del_id').value = u.id || '';
-  
-  // Basic editable fields
-  document.getElementById('f_first').value= u.first_name || '';
-  document.getElementById('f_last').value = u.last_name || '';
-  document.getElementById('f_phone').value= u.phone || '';
-  document.getElementById('f_dept').value = u.department || '';
-  document.getElementById('f_job').value  = u.job_title || '';
-  document.getElementById('f_dob').value  = safeDate(u.date_of_birth);
-  document.getElementById('f_anniv').value= safeDate(u.work_anniversary);
-  
-  // Admin-controlled fields - set value for all
-  document.getElementById('f_email').value= u.email || '';
-  document.getElementById('f_usern').value= u.username || '';
-  document.getElementById('f_role').value = u.role || 'user';
-  document.getElementById('f_mgr').value  = u.manager_id || '';
-  document.getElementById('f_loc').value  = u.location_id || '';
-  document.getElementById('f_active').checked = (u.active == 1); // FIX: Ensure active checkbox correctly reflects data
-  
-  // --- Admin/Self-service access control ---
-  
-  // 1. Admin only fields (role, active, manager, location, queues)
-  document.querySelectorAll('.field_admin').forEach(el=>{
-    // Only admins see these controls
-    el.style.display = IS_ADMIN ? 'grid' : 'none'; 
-  });
-  
-  // 2. Readonly fields for non-admin on email/username (Admin is always able to edit)
-  const emailInput = document.getElementById('f_email');
-  const usernameInput = document.getElementById('f_usern');
-  
-  const emailNote = document.getElementById('note_email');
-  const usernNote = document.getElementById('note_usern');
-
-  const shouldBeReadOnly = !IS_ADMIN;
-
-  emailInput.readOnly = shouldBeReadOnly;
-  usernameInput.readOnly = shouldBeReadOnly;
-
-  emailNote.textContent = shouldBeReadOnly ? ' (Read Only)' : '';
-  usernNote.textContent = shouldBeReadOnly ? ' (Read Only)' : '';
-  
-  emailInput.classList.toggle('input-readonly', shouldBeReadOnly);
-  usernameInput.classList.toggle('input-readonly', shouldBeReadOnly);
-
-
-  // 3. Queue checkboxes (Admin only)
-  document.querySelectorAll('#modal-edit-user input.qcb').forEach(cb => {
-    cb.checked = qs.includes(cb.value);
-    cb.disabled = !IS_ADMIN;
-  });
-
-  document.getElementById('edit_dlg_title').textContent = is_self ? 'Edit My Profile' : 'Edit User';
-
-
-  window.openModal('modal-edit-user');
-}
-function closeEdit(){ window.closeModal('modal-edit-user'); }
-
 </script>
-
-<?php include __DIR__ . '/partials/footer.php'; ?>
+<?php require __DIR__ . '/partials/footer.php'; ?>

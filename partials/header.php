@@ -1,95 +1,439 @@
 <?php
-// partials/header.php (stable)
-require_once __DIR__ . '/../config.php';
 require_once __DIR__ . '/../auth.php';
+require_once __DIR__ . '/../db.php';
 
-if (session_status() !== PHP_SESSION_ACTIVE) {
-  session_start();
-}
-if (empty($_SESSION['csrf'])) {
-  $_SESSION['csrf'] = bin2hex(random_bytes(32));
-}
+$me = user();
 
-/*
-  Pages like login.php set $auth_page = true to hide the main nav.
-  If not set, default to false.
-*/
-if (!isset($auth_page)) {
-  $auth_page = false;
-}
+/* allow pages (e.g., login.php) to set $auth_page = true */
+if (!isset($auth_page)) { $auth_page = false; }
 
-/* HTML escape helper (idempotent if already declared elsewhere) */
+/* esc helper */
 if (!function_exists('e')) {
   function e($v){ return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
 }
 
-$me = user(); // may be null on auth pages
-$title = isset($page_title) && $page_title !== '' ? $page_title : 'W17 Dashboard';
+/* db + manager/children helper */
+$pdo = db();
+function has_children($uid, $pdo){
+  static $cache = [];
+  if (isset($cache[$uid])) return $cache[$uid];
+  $st=$pdo->prepare("SELECT COUNT(*) FROM users WHERE manager_id=?");
+  $st->execute([$uid]);
+  return $cache[$uid] = ($st->fetchColumn() > 0);
+}
+
+/* active page */
+$page = basename($_SERVER['PHP_SELF']);
 ?>
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?php echo e($title); ?></title>
-
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#88C28F">
+<title>Workshop17 - Dashboard</title>
 
 <style>
+/* ----------------- Design tokens ----------------- */
 :root{
   --primary:#88C28F;
+  --primary-600:#73b57b;
   --primary-dark:#5a8860;
   --danger:#ef4444;
   --warning:#ff9800;
-  --dark:#2c3e50;
-  --gray:#6b7280;
-  --light:#f5f7fa;
+  --dark:#1f2937;
+  --muted:#6b7280;
+  --gray-50:#fafbfc;
+  --gray-100:#f5f7fa;
+  --gray-150:#f0f2f5;
+  --gray-200:#e5e7eb;
+  --gray-300:#d1d5db;
+  --gray-700:#374151;
   --white:#fff;
+  --radius:12px;
+  --shadow:0 2px 10px rgba(0,0,0,.06);
+  --shadow-lg:0 14px 30px rgba(0,0,0,.14);
 }
-html,body{height:100%;}
-body{background:#f6f7fb;color:#1f2937;margin:0;}
-a{color:var(--primary);}
-.btn-primary{background:var(--primary);border-color:var(--primary);}
-.btn-primary:hover{background:var(--primary-dark);border-color:var(--primary-dark);}
-.card{border:0;box-shadow:0 2px 10px rgba(0,0,0,.06);border-radius:.75rem;background:#fff;}
-.table thead th{background:#f0f4f7;border-bottom:1px solid #e5e7eb;}
-.form-check-input:checked{background-color:var(--primary);border-color:var(--primary);}
+
+/* ----------------- Base reset ----------------- */
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
+  color:#111;background:var(--gray-100);-webkit-font-smoothing:antialiased;line-height:1.35;
+}
+
+/* ----------------- App shell ----------------- */
+.wrap{display:flex;min-height:100dvh}
+.sidebar{
+  width:272px;min-height:100dvh;position:sticky;top:0;z-index:60;flex-shrink:0;
+  background:linear-gradient(180deg,var(--primary) 0%, var(--primary-dark) 100%);
+  color:#fff;box-shadow:2px 0 16px rgba(0,0,0,.08)
+}
+.sidebar .brand{padding:1.25rem 1.5rem;background:rgba(0,0,0,.08);border-bottom:1px solid rgba(255,255,255,.12)}
+.sidebar .brand h1{font-size:1.2rem;font-weight:800;margin:0}
+.sidebar .brand p{opacity:.92;margin:.35rem 0 0;font-size:.92rem}
+
+.nav{padding:.4rem 0}
+.nav a, .nav button{
+  width:100%;display:flex;gap:.75rem;align-items:center;justify-content:flex-start;
+  padding:.9rem 1.25rem;color:#fff;text-decoration:none;background:transparent;border:0;cursor:pointer;
+  font-size:.96rem;border-left:4px solid transparent;transition:padding .15s ease, background .15s ease
+}
+.nav a:hover, .nav button:hover{background:rgba(255,255,255,.12);padding-left:1.6rem}
+.nav .active{background:rgba(255,255,255,.20);border-left-color:#fff}
+
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+
+/* Topbar */
+.topbar{
+  position:sticky;top:0;z-index:50;background:var(--white);box-shadow:var(--shadow);
+  display:flex;align-items:center;gap:.75rem;padding:.65rem .9rem;
+}
+.topbar .burger{
+  border:0;background:transparent;font-size:1.45rem;cursor:pointer;line-height:1;padding:.35rem .55rem;border-radius:10px;
+}
+.topbar .burger:hover{background:var(--gray-150)}
+.topbar .title{font-weight:800;color:var(--dark);font-size:1.05rem;margin-left:.35rem}
+.topbar .spacer{flex:1}
+
+/* User area with dropdown */
+.user-area{position:relative}
+.user-chip{
+  display:flex;align-items:center;gap:.6rem;padding:.35rem .6rem;border-radius:999px;background:var(--gray-150);
+  color:var(--dark);font-weight:600;cursor:pointer;border:0
+}
+.user-chip .avatar{
+  width:28px;height:28px;border-radius:50%;background:#d9ead3;display:grid;place-items:center;font-size:.8rem;font-weight:800;color:#2c3e50
+}
+.user-meta{display:flex;flex-direction:column;line-height:1}
+.user-meta .name{font-weight:700;font-size:.92rem}
+.user-meta .role{font-size:.75rem;color:var(--muted)}
+
+.dropdown{position:relative}
+.dropdown-menu{
+  position:absolute;right:0;top:calc(100% + 8px);min-width:220px;background:#fff;border:1px solid var(--gray-200);
+  border-radius:12px;box-shadow:var(--shadow);padding:.35rem;display:none;z-index:80
+}
+.dropdown.open .dropdown-menu{display:block}
+.dropdown-item{display:flex;align-items:center;gap:.6rem;padding:.6rem .7rem;border-radius:8px;color:#111;text-decoration:none}
+.dropdown-item:hover{background:var(--gray-150)}
+.dropdown-sep{height:1px;background:var(--gray-200);margin:.35rem 0}
+
+/* Content container */
+.page{padding:1.25rem;display:block;width:100%;max-width:1400px;margin:0 auto}
+@media (min-width:1100px){ .page{padding:1.5rem 2rem} }
+
+/* Cards */
+.card{background:#fff;border-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:1.1rem;overflow:hidden}
+.card .card-h{
+  padding:.85rem 1rem;border-bottom:1px solid var(--gray-200);background:#fafafa;
+  display:flex;gap:.75rem;justify-content:space-between;align-items:center
+}
+.card .card-h h2,.card .card-h h3{margin:0;font-size:1.05rem}
+.card .card-b{padding:1rem}
+
+/* Buttons */
+.btn{border:0;border-radius:10px;padding:.65rem 1rem;font-weight:800;cursor:pointer;display:inline-flex;align-items:center;gap:.5rem}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.btn-primary{background:var(--primary);color:#fff}
+.btn-primary:hover{filter:brightness(.96)}
+.btn-secondary{background:var(--dark);color:#fff}
+.btn-light{background:var(--gray-150);color:var(--dark)}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-outline{background:transparent;border:1px solid var(--gray-300);color:var(--dark)}
+.btn-icon{padding:.5rem;border-radius:10px}
+
+/* Inputs */
+.input, select, textarea{
+  width:100%;padding:.7rem .8rem;border:1px solid var(--gray-300);border-radius:10px;background:#fbfbfb;font-size:.98rem
+}
+.input:focus, select:focus, textarea:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 3px rgba(136,194,143,.22);background:#fff}
+.input-sm{padding:.5rem .6rem;border-radius:8px;font-size:.9rem}
+.input-inline{max-width:280px}
+
+/* Grid utilities */
+.grid{display:grid;gap:1rem}
+.grid-2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.grid-4{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:1100px){ .grid-4{grid-template-columns:repeat(3,minmax(0,1fr))} }
+@media (max-width:900px){ .grid-3,.grid-4{grid-template-columns:repeat(2,minmax(0,1fr))} }
+@media (max-width:640px){ .grid-2,.grid-3,.grid-4{grid-template-columns:1fr} }
+
+/* Badges */
+.badge{display:inline-block;padding:.25rem .6rem;border-radius:999px;font-size:.72rem;font-weight:800}
+.badge-success{background:rgba(76,175,80,.15);color:#2e7d32}
+.badge-warning{background:rgba(255,152,0,.15);color:#b26a00}
+.badge-danger{background:rgba(239,68,68,.15);color:#b91c1c}
+.badge-primary{background:rgba(136,194,143,.18);color:#285d33}
+
+/* Tables */
+.table-wrap{width:100%;overflow:auto;border-radius:10px;border:1px solid var(--gray-200);background:#fff}
+.table{width:100%;border-collapse:collapse}
+.table th{
+  position:sticky;top:0;background:#f8f9fa;text-align:left;padding:12px;border-bottom:2px solid #e5e7eb;
+  font-size:.8rem;letter-spacing:.3px;text-transform:uppercase;z-index:1
+}
+.table td{padding:12px;border-bottom:1px solid #eee;vertical-align:top}
+.table tbody tr:hover{background:#fcfcfd}
+.table .fit{width:1%;white-space:nowrap}
+
+/* Utilities */
+.mt-1{margin-top:.25rem}.mt-2{margin-top:.5rem}.mt-3{margin-top:1rem}
+.mb-1{margin-bottom:.25rem}.mb-2{margin-bottom:.5rem}.mb-3{margin-bottom:1rem}
+.gap-1{gap:.25rem}.gap-2{gap:.5rem}.gap-3{gap:1rem}
+.flex{display:flex}.items-center{align-items:center}.justify-between{justify-content:space-between}
+.hidden{display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+/* ===== Modals (global) ===== */
+.modal-backdrop{
+  position:fixed; inset:0;
+  background:rgba(0,0,0,.5);
+  display:none;
+  z-index:9998; /* below modal, above everything else */
+}
+.modal{
+  position:fixed; inset:0;
+  display:none;
+  z-index:9999; /* ensure modal container is on top */
+  align-items:center; justify-content:center;
+  padding:1rem; overflow:hidden;
+}
+.modal .modal-card{
+  width:min(820px,96vw);
+  background:#fff; border-radius:16px; box-shadow:var(--shadow-lg);
+  max-height:90vh; overflow:auto; -webkit-overflow-scrolling:touch;
+  z-index:10000; /* card above backdrop and container */
+}
+.modal .modal-h{padding:1rem 1.1rem;border-bottom:1px solid var(--gray-200);display:flex;justify-content:space-between;align-items:center}
+.modal .modal-b{padding:1.1rem}
+.modal .modal-f{padding:1rem 1.1rem;border-top:1px solid var(--gray-200);display:flex;justify-content:flex-end;gap:.6rem}
+
+/* ===== Auth (login) page ===== */
+.auth-page{background:var(--primary);}
+.auth-page .wrap{display:block;}
+.auth-page .main{min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:1rem}
+.auth-card{max-width:520px;width:100%;background:#fff;border-radius:24px;box-shadow:0 20px 50px rgba(0,0,0,.15);overflow:hidden;margin:auto}
+.auth-card .card-h{background:#ffffff;border-bottom:1px solid #f0f2f4}
+.auth-title{font-size:1.9rem;font-weight:800;color:#2c3e50;text-align:center}
+.auth-body{padding:1.25rem 1.5rem 1.75rem}
+.auth-group{margin:1rem 0}
+.auth-input{width:100%;padding:.95rem 1rem;border:1px solid var(--gray-300);border-radius:14px;background:#fbfbfb}
+.auth-input:focus{outline:none;border-color:var(--primary);background:#fff;box-shadow:0 0 0 3px rgba(136,194,143,.22)}
+.auth-btn{width:100%;border:0;border-radius:14px;padding:.95rem 1.2rem;font-weight:800;font-size:1rem;cursor:pointer;background:var(--primary);color:#fff}
+.auth-btn:hover{filter:brightness(.96)}
+.auth-muted{margin-top:.9rem;text-align:center;font-size:.95rem;color:var(--muted)}
+.auth-muted a{color:var(--primary);text-decoration:none}
+
+/* --- OAuth buttons --- */
+.auth-divider{display:flex;align-items:center;gap:.75rem;margin:1rem 0;color:var(--muted);font-weight:700}
+.auth-divider::before,.auth-divider::after{content:"";height:1px;background:var(--gray-200);flex:1}
+.oauth-buttons{display:grid;gap:.6rem}
+.oauth-btn{
+  width:100%; display:flex; align-items:center; justify-content:center; gap:.6rem;
+  border:1px solid var(--gray-300); background:#fff; color:#111; padding:.9rem 1rem;
+  border-radius:14px; font-weight:800; cursor:pointer; text-decoration:none;
+}
+.oauth-btn:hover{background:var(--gray-50)}
+.oauth-icon{width:18px;height:18px;display:inline-block}
+
+/* ===== Dashboard widgets ===== */
+.kpi-grid{display:grid;gap:1rem;grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:1100px){ .kpi-grid{grid-template-columns:repeat(3,minmax(0,1fr))} }
+@media (max-width:900px){ .kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+@media (max-width:640px){ .kpi-grid{grid-template-columns:1fr} }
+.kpi-card{background:#fff;border:1px solid var(--gray-200);border-radius:12px;box-shadow:var(--shadow);padding:1rem;display:flex;flex-direction:column;gap:.35rem}
+.kpi-label{font-size:.8rem;letter-spacing:.3px;text-transform:uppercase;color:var(--muted);font-weight:800}
+.kpi-value{font-size:2rem;font-weight:800}
+
+/* Celebrations */
+.cele-wrap{display:grid;gap:1rem;grid-template-columns:repeat(2,minmax(0,1fr))}
+@media (max-width:900px){ .cele-wrap{grid-template-columns:1fr} }
+.cele-banner{background:var(--primary);color:#fff;border-radius:12px;box-shadow:var(--shadow);overflow:hidden}
+.cele-banner .card-h{background:transparent;border:none;color:#fff}
+.cele-card{
+  background: rgba(255,255,255,.12);
+  border-radius: 12px;
+  padding: 1rem;
+  display: grid;
+  grid-template-columns: 48px 1fr auto;
+  align-items: center;
+  gap: .75rem;
+  box-shadow: var(--shadow);
+  color:#fff;
+  min-width:0;
+}
+.cele-muted{ background:#fff; color: var(--dark); }
+.cele-emoji{font-size:2rem;line-height:1}
+.cele-name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cele-sub{opacity:.95}
+.cele-btn{background:#fff;color:var(--dark);border:none;padding:.5rem .75rem;border-radius:10px;box-shadow: var(--shadow);cursor:pointer;white-space:nowrap}
+
+/* Celebration lists layout */
+.cele-list{display:grid;gap:1rem;grid-template-columns:repeat(2,minmax(0,1fr))}
+@media (max-width:900px){ .cele-list{grid-template-columns:1fr} }
+
+/* Confetti */
+@keyframes fall{
+  0%   { transform: translateY(-10vh) rotate(0deg);   opacity:1; }
+  100% { transform: translateY(110vh) rotate(720deg); opacity:.9; }
+}
+
+/* Mobile */
+@media (max-width: 990px){
+  .sidebar{display:none}
+  .page{padding:1rem}
+}
 </style>
 
-<!-- Expose CSRF for small JS calls on pages -->
-<script>window.CSRF="<?php echo $_SESSION['csrf']; ?>";</script>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  // Sidebar toggle (mobile)
+  const burger = document.querySelector('[data-burger]');
+  const sidebar = document.querySelector('.sidebar');
+  if (burger && sidebar){
+    burger.addEventListener('click', () => {
+      if (getComputedStyle(sidebar).display === 'none') {
+        sidebar.style.display = 'block';
+        const off = (e) => {
+          if (!sidebar.contains(e.target) && e.target !== burger) {
+            sidebar.style.display = 'none';
+            document.removeEventListener('click', off);
+          }
+        };
+        setTimeout(() => document.addEventListener('click', off), 0);
+      } else {
+        sidebar.style.display = 'none';
+      }
+    });
+  }
+
+  // Dropdowns (generic + user menu)
+  document.querySelectorAll('.dropdown [data-toggle="dropdown"]').forEach(btn=>{
+    btn.addEventListener('click', (e)=>{
+      e.preventDefault();
+      const dd = btn.closest('.dropdown');
+      dd.classList.toggle('open');
+      const expanded = dd.classList.contains('open');
+      btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    });
+  });
+  document.addEventListener('click', (e)=>{
+    document.querySelectorAll('.dropdown.open').forEach(dd=>{
+      if(!dd.contains(e.target)) dd.classList.remove('open');
+    });
+  });
+
+  /* ===== Global modal helpers ===== */
+  window.openModal = function(name){
+    const m = document.getElementById('modal-' + name);
+    if (!m) return;
+    let backdrop = m.querySelector('.modal-backdrop');
+    if (!backdrop) {
+      backdrop = document.createElement('div');
+      backdrop.className = 'modal-backdrop';
+      m.insertBefore(backdrop, m.firstChild);
+    }
+    backdrop.style.display = 'block';
+    m.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+    backdrop.addEventListener('click', () => window.closeModal(name), { once:true });
+  };
+
+  window.closeModal = function(name){
+    const m = document.getElementById('modal-' + name);
+    if (!m) return;
+    const backdrop = m.querySelector('.modal-backdrop');
+    if (backdrop) backdrop.style.display = 'none';
+    m.style.display = 'none';
+    document.body.style.overflow = '';
+  };
+
+  // Declarative triggers
+  document.querySelectorAll('[data-open]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const id = btn.getAttribute('data-open');
+      if (id) window.openModal(id);
+    });
+  });
+  document.querySelectorAll('[data-close]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const id = btn.getAttribute('data-close');
+      if (id) window.closeModal(id);
+      else {
+        const modal = btn.closest('.modal');
+        if (modal && modal.id.startsWith('modal-')) {
+          window.closeModal(modal.id.replace('modal-',''));
+        }
+      }
+    });
+  });
+
+  // Confirm helper
+  document.querySelectorAll('[data-confirm]').forEach(el=>{
+    el.addEventListener('click', (e)=>{
+      const msg = el.getAttribute('data-confirm') || 'Are you sure?';
+      if(!confirm(msg)) e.preventDefault();
+    });
+  });
+});
+</script>
 </head>
-<body>
 
-<?php if (!$auth_page): ?>
-<nav class="navbar navbar-expand-lg navbar-light bg-white border-bottom shadow-sm">
-  <div class="container-fluid">
-    <a class="navbar-brand fw-semibold" href="/dashboard.php" style="color:var(--primary)">W17</a>
-
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navMain" aria-controls="navMain" aria-expanded="false" aria-label="Toggle navigation">
-      <span class="navbar-toggler-icon"></span>
-    </button>
-
-    <div id="navMain" class="collapse navbar-collapse">
-      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-        <li class="nav-item"><a class="nav-link" href="/dashboard.php">Dashboard</a></li>
-        <li class="nav-item"><a class="nav-link" href="/tickets.php">Tickets</a></li>
-        <li class="nav-item"><a class="nav-link" href="/tasks.php">Tasks</a></li>
-        <li class="nav-item"><a class="nav-link" href="/users.php">Users</a></li>
-        <li class="nav-item"><a class="nav-link" href="/locations.php">Locations</a></li>
-        <li class="nav-item"><a class="nav-link" href="/reports.php">Reports</a></li>
-      </ul>
-
-      <div class="d-flex align-items-center gap-3">
-        <span class="text-muted small">
-          <?php echo e($me['name'] ?? ($me['email'] ?? '')); ?>
-        </span>
-        <a href="/logout.php" class="btn btn-sm btn-outline-secondary">Logout</a>
+<body class="<?= $auth_page ? 'auth-page' : '' ?>">
+<div class="wrap">
+  <?php if(is_logged_in()): ?>
+    <aside class="sidebar" aria-label="Primary">
+      <div class="brand">
+        <h1>Workshop17</h1>
+        <p><?= e(($me['first_name'] ?? '').' '.($me['last_name'] ?? '')) ?> (<?= e($me['role'] ?? '') ?>)</p>
       </div>
-    </div>
-  </div>
-</nav>
-<?php endif; ?>
+      <nav class="nav">
+        <a href="<?= BASE_URL ?>/dashboard.php" class="<?= $page==='dashboard.php'?'active':'' ?>">📊 Dashboard</a>
+        <a href="<?= BASE_URL ?>/tickets.php"   class="<?= $page==='tickets.php'  ?'active':'' ?>">🎫 Tickets</a>
+        <a href="<?= BASE_URL ?>/tasks.php"     class="<?= $page==='tasks.php'    ?'active':'' ?>">📋 Tasks</a>
+        <a href="<?= BASE_URL ?>/locations.php" class="<?= $page==='locations.php'?'active':'' ?>">📍 Locations</a>
+        <a href="<?= BASE_URL ?>/orgchart.php"  class="<?= $page==='orgchart.php' ?'active':'' ?>">🗣️ Organogram</a>
+        <?php if(($me['role']??'')==='admin'): ?>
+          <a href="<?= BASE_URL ?>/users.php"           class="<?= $page==='users.php'?'active':'' ?>">👥 Users</a>
+          <a href="<?= BASE_URL ?>/system_settings.php" class="<?= $page==='system_settings.php'?'active':'' ?>">⚙️ System Settings</a>
+          <a href="<?= BASE_URL ?>/monitoring_admin.php" class="<?= $page==='monitoring_admin.php'?'active':'' ?>">⚙️ Monitoring Settings</a>
+        <?php endif; ?>
+        <?php if(has_children($me['id'] ?? 0, $pdo)): ?>
+          <a href="<?= BASE_URL ?>/reports.php" class="<?= $page==='reports.php'?'active':'' ?>">📈 Reports</a>
+        <?php endif; ?>
+        <a href="<?= BASE_URL ?>/logout.php">🚪 Logout</a>
+      </nav>
+    </aside>
+  <?php endif; ?>
 
-<!-- Important: Do NOT close body/html here.
-     Your partials/footer.php should include Bootstrap JS and close the tags. -->
+  <main class="main">
+    <?php if(is_logged_in() && !$auth_page): ?>
+      <div class="topbar no-print">
+        <button class="burger" type="button" aria-label="Toggle menu" data-burger>☰</button>
+        <div class="title">Workshop17 Dashboard</div>
+        <div class="spacer"></div>
+
+        <div class="user-area dropdown">
+          <button class="user-chip" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+            <div class="avatar" aria-hidden="true">
+              <?= strtoupper(substr(($me['first_name'] ?? 'U'),0,1)) ?>
+            </div>
+            <div class="user-meta">
+              <span class="name"><?= e(($me['first_name'] ?? 'User').' '.($me['last_name'] ?? '')) ?></span>
+              <span class="role"><?= e($me['role'] ?? '') ?></span>
+            </div>
+          </button>
+          <div class="dropdown-menu" role="menu" aria-label="User menu">
+            <a class="dropdown-item" href="<?= BASE_URL ?>/dashboard.php">🏠 Dashboard</a>
+            <a class="dropdown-item" href="<?= BASE_URL ?>/users.php?id=<?= (int)$me['id'] ?>">👤 My Profile</a>
+            <div class="dropdown-sep"></div>
+            <a class="dropdown-item" href="<?= BASE_URL ?>/logout.php">🚪 Logout</a>
+          </div>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <section class="page">
+      
