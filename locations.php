@@ -1,16 +1,22 @@
 <?php
-// locations.php — card view by region; admin-only create/edit; custom fields; modal controller JS
+// locations.php — card view for all locations; admin-only create/edit (with 4-digit phone_ext)
 require_once __DIR__ . '/db.php';
 require_once __DIR__ . '/auth.php';
 
 if (session_status() !== PHP_SESSION_ACTIVE) session_start();
+
 $pdo = db();
 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
 $me = user();
 if (!$me) { header('Location: login.php'); exit; }
-$is_admin = ($me['role'] ?? '') === 'admin';
+$is_admin = (string)($me['role'] ?? '') === 'admin';
 
-/* CSRF */
+if (!function_exists('e')) {
+  function e($v, $enc = true) { return $enc ? htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8') : (string)$v; }
+}
+
+/* ---------------- CSRF ---------------- */
 if (empty($_SESSION['csrf'])) {
   $_SESSION['csrf'] = bin2hex(random_bytes(32));
 }
@@ -22,21 +28,12 @@ function csrf_check() {
   }
 }
 
-/* Helpers */
+/* ---------------- Helpers ---------------- */
 function first($arr, $key, $default = '') { return isset($arr[$key]) ? trim((string)$arr[$key]) : $default; }
 function email_or_null($v){ $v = trim((string)$v); return $v === '' ? null : (filter_var($v, FILTER_VALIDATE_EMAIL) ? $v : false); }
 function phone_or_null($v){ $v = trim((string)$v); return $v === '' ? null : $v; }
-function phone_ext_or_null($v){
-  $v = trim((string)$v);
-  if ($v === '') return null;
-  return preg_match('/^\d{4}$/', $v) ? $v : false; // exactly 4 digits
-}
-function date_or_null($v){
-  $v = trim((string)$v);
-  if ($v === '') return null;
-  $d = DateTime::createFromFormat('Y-m-d', $v);
-  return ($d && $d->format('Y-m-d') === $v) ? $v : false;
-}
+function phone_ext_or_null($v){ $v = trim((string)$v); if ($v === '') return null; return preg_match('/^\d{4}$/', $v) ? $v : false; }
+function date_or_null($v){ $v = trim((string)$v); if ($v === '') return null; $d = DateTime::createFromFormat('Y-m-d', $v); return ($d && $d->format('Y-m-d') === $v) ? $v : false; }
 function col_exists(PDO $pdo, string $table, string $col): bool {
   $st = $pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1");
   $st->execute([$table,$col]);
@@ -44,7 +41,8 @@ function col_exists(PDO $pdo, string $table, string $col): bool {
 }
 function sanitise_key($str) { return preg_replace('/[^a-z0-9_]/', '', strtolower(str_replace(' ', '_', $str))); }
 
-/* Schema & Migrations (safe no-op if already present) */
+/* ---------------- Schema & Migrations ---------------- */
+// Regions
 $pdo->exec("
   CREATE TABLE IF NOT EXISTS regions (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -56,6 +54,8 @@ if (!col_exists($pdo, 'locations', 'region_id')) {
   $pdo->exec("ALTER TABLE locations ADD COLUMN region_id INT NULL");
   $pdo->exec("ALTER TABLE locations ADD CONSTRAINT fk_loc_region FOREIGN KEY (region_id) REFERENCES regions(id) ON DELETE SET NULL");
 }
+
+// Custom fields
 $pdo->exec("
   CREATE TABLE IF NOT EXISTS location_custom_fields (
     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -76,22 +76,20 @@ $pdo->exec("
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
 
-/* Preload custom fields so POST handler can use it */
-$custom_fields = $pdo->query("SELECT * FROM location_custom_fields ORDER BY sort_order, name")->fetchAll(PDO::FETCH_ASSOC);
-
-/* POST (admin only) */
+/* ---------------- POST (admin only) ---------------- */
 $form_errors  = [];
 $form_payload = [];
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   if (!$is_admin) { http_response_code(403); exit('Forbidden'); }
   csrf_check();
 
-  /* Region management */
+  // Regions
   if (isset($_POST['add_region'])) {
     $name = first($_POST,'r_name');
     $desc = first($_POST,'r_desc');
     if ($name === '') { header('Location: locations.php?msg=error&err=Region name is required#modal-manage-regions'); exit; }
-    $pdo->prepare("INSERT INTO regions (name, description) VALUES (?,?)")->execute([$name, $desc]);
+    $pdo->prepare("INSERT INTO regions (name, description) VALUES (?,?)")->execute([$name, $desc ?: null]);
     header('Location: locations.php?msg=region_created#modal-manage-regions'); exit;
   }
   if (isset($_POST['del_region'])) {
@@ -100,10 +98,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Location: locations.php?msg=region_deleted'); exit;
   }
 
-  /* Custom field management */
+  // Custom fields
   if (isset($_POST['add_field'])) {
     $name = first($_POST,'cf_name');
-    $type = first($_POST,'cf_type');
+    $type = first($_POST,'cf_type','text');
     $key  = sanitise_key($name);
     if ($name === '' || $key === '') { header('Location: locations.php?msg=error&err=Field name and key are required#modal-manage-fields'); exit; }
     $pdo->prepare("INSERT INTO location_custom_fields (name, field_key, field_type) VALUES (?,?,?)")->execute([$name, $key, $type]);
@@ -115,7 +113,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Location: locations.php?msg=field_deleted'); exit;
   }
 
-  /* Location create/update */
+  // Create / Update location
   $is_create = isset($_POST['create']);
   $is_update = isset($_POST['update']);
   if ($is_create || $is_update) {
@@ -130,6 +128,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $phoneExt = phone_ext_or_null(first($_POST,'phone_ext'));
     $email    = email_or_null(first($_POST,'email'));
     $active   = isset($_POST['active']) ? 1 : 0;
+
     $custom_values = $_POST['custom_field'] ?? [];
 
     if ($code === '' || $name === '') $form_errors[] = 'Code and Name are required.';
@@ -157,10 +156,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           (code, name, region_id, birthdate, address, manager, phone, phone_ext, email, active)
           VALUES (:code, :name, :region_id, :birthdate, :addr, :mgr, :phone, :phone_ext, :email, :active)");
         $stmt->execute([
-          ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId, ':birthdate'=>($birth === false ? null : $birth),
-          ':addr'=>($address === '' ? null : $address), ':mgr'=>($manager === '' ? null : (int)$manager),
-          ':phone'=>$phone, ':phone_ext'=>($phoneExt === false ? null : $phoneExt),
-          ':email'=>($email === null ? null : $email), ':active'=>$active
+          ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId,
+          ':birthdate'=>($birth === false ? null : $birth),
+          ':addr'=>($address === '' ? null : $address),
+          ':mgr'=>($manager === '' ? null : (int)$manager),
+          ':phone'=>$phone,
+          ':phone_ext'=>($phoneExt === false ? null : $phoneExt),
+          ':email'=>($email === null ? null : $email),
+          ':active'=>$active
         ]);
         $id = (int)$pdo->lastInsertId();
       } else {
@@ -169,34 +172,45 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 manager=:mgr, phone=:phone, phone_ext=:phone_ext, email=:email, active=:active
             WHERE id=:id");
         $stmt->execute([
-          ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId, ':birthdate'=>($birth === false ? null : $birth),
-          ':addr'=>($address === '' ? null : $address), ':mgr'=>($manager === '' ? null : (int)$manager),
-          ':phone'=>$phone, ':phone_ext'=>($phoneExt === false ? null : $phoneExt),
-          ':email'=>($email === null ? null : $email), ':active'=>$active, ':id'=>$id
+          ':code'=>$code, ':name'=>$name, ':region_id'=>$regionId,
+          ':birthdate'=>($birth === false ? null : $birth),
+          ':addr'=>($address === '' ? null : $address),
+          ':mgr'=>($manager === '' ? null : (int)$manager),
+          ':phone'=>$phone,
+          ':phone_ext'=>($phoneExt === false ? null : $phoneExt),
+          ':email'=>($email === null ? null : $email),
+          ':active'=>$active, ':id'=>$id
         ]);
       }
 
-      // Save custom field values
-      $upsert_cf = $pdo->prepare("INSERT INTO location_field_values (location_id, field_id, field_value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE field_value=VALUES(field_value)");
-      foreach ($custom_fields as $cf) {
-        $field_id = (int)$cf['id'];
-        $value = $custom_values[$field_id] ?? null;
-        if ($value !== null) { $upsert_cf->execute([$id, $field_id, (string)$value]); }
+      // Save custom field values (fetch list right here to be safe)
+      $custom_fields_save = $pdo->query("SELECT id FROM location_custom_fields ORDER BY id")->fetchAll(PDO::FETCH_ASSOC);
+      $upsert_cf = $pdo->prepare("
+        INSERT INTO location_field_values (location_id, field_id, field_value)
+        VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE field_value=VALUES(field_value)
+      ");
+      foreach ($custom_fields_save as $cf) {
+        $fid = (int)$cf['id'];
+        $val = $custom_values[$fid] ?? null;
+        if ($val !== null) $upsert_cf->execute([$id, $fid, (string)$val]);
       }
 
-      header('Location: locations.php?msg='.($is_create ? 'created' : 'updated')); exit;
+      header('Location: locations.php?msg='.($is_create ? 'created' : 'updated'));
+      exit;
     } else {
       $_SESSION['form_errors']  = $form_errors;
       $_SESSION['form_payload'] = $_POST;
-      header('Location: locations.php?msg=error#modal-'.($is_create ? 'create' : 'edit')); exit;
+      header('Location: locations.php?msg=error#modal-'.($is_create ? 'create' : 'edit'));
+      exit;
     }
   }
 }
 
-/* Fetch lists */
+/* ---------------- Fetch lists (for display) ---------------- */
 $regions = $pdo->query("SELECT * FROM regions ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+$custom_fields = $pdo->query("SELECT * FROM location_custom_fields ORDER BY sort_order, name")->fetchAll(PDO::FETCH_ASSOC);
 
-// Fetch all custom field values indexed by location_id and field_id
+// All custom values -> map[location_id][field_id] = value
 $field_values_raw = $pdo->query("SELECT location_id, field_id, field_value FROM location_field_values")->fetchAll(PDO::FETCH_ASSOC);
 $field_values_map = [];
 foreach ($field_values_raw as $v) {
@@ -211,7 +225,7 @@ $sql = "SELECT l.*, l.manager AS manager_user_id, r.name AS region_name, r.id AS
         ORDER BY r.name ASC, l.code ASC";
 $locations = $pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);
 
-/* Group by region and inject custom fields */
+/* Group by region and enrich row */
 $locations_by_region = [];
 foreach ($locations as $l) {
   $lid = (int)$l['id'];
@@ -219,6 +233,7 @@ foreach ($locations as $l) {
   $l['manager_name'] = $mgrName !== '' ? $mgrName : ($l['mgr_email'] ?? '—');
   $l['birthdate_disp'] = $l['birthdate'] ? DateTime::createFromFormat('Y-m-d',$l['birthdate'])->format('d M Y') : null;
   $l['custom_fields'] = $field_values_map[$lid] ?? [];
+
   $region_name = $l['region_name'] ?: 'Unassigned';
   $locations_by_region[$region_name][] = $l;
 }
@@ -282,12 +297,17 @@ include __DIR__ . '/partials/header.php';
               </span></div>
 
               <div class="loc-row"><span class="k">Email</span><span class="v"><?= $l['email'] ? e($l['email']) : '—' ?></span></div>
-              
+
               <?php if ($is_admin): ?>
-              <div class="loc-actions">
-                <button type="button" class="btn btn-light btn-sm btn-edit" onclick="event.stopPropagation(); openEditModal(<?= (int)$l['id'] ?>)">Edit</button>
-              </div>
+                <div class="loc-actions">
+                  <button type="button" class="btn btn-light btn-sm btn-edit" data-id="<?= (int)$l['id'] ?>" onclick="event.stopPropagation(); openEditModal(<?= (int)$l['id'] ?>)">Edit</button>
+                </div>
               <?php endif; ?>
+
+              <!-- Hidden enriched JSON for precise Edit modal population -->
+              <span id="locjson-<?= (int)$l['id'] ?>"
+                    data-json='<?= e(json_encode($l, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)) ?>'
+                    style="display:none"></span>
             </div>
           <?php endforeach; ?>
         </div>
@@ -299,7 +319,7 @@ include __DIR__ . '/partials/header.php';
 <!-- Detail Modal -->
 <div id="modal-location-detail" class="modal" style="display:none">
   <div class="modal-backdrop" data-close="location-detail"></div>
-  <div class="modal-card" style="max-width:500px">
+  <div class="modal-card" style="max-width:520px">
     <div class="modal-h">
       <h3 id="ld_name">Location Detail</h3>
       <button type="button" class="btn" data-close="location-detail">✕</button>
@@ -313,7 +333,7 @@ include __DIR__ . '/partials/header.php';
 <!-- Create Modal -->
 <div id="modal-create" class="modal" style="display:none">
   <div class="modal-backdrop" data-close="create"></div>
-  <div class="modal-card" style="max-width:720px">
+  <div class="modal-card" style="max-width:760px">
     <div class="modal-h">
       <h3>Add Location</h3>
       <button type="button" class="btn" data-close="create">✕</button>
@@ -325,7 +345,7 @@ include __DIR__ . '/partials/header.php';
         <div class="form-grid">
           <div class="field"><label>Code *</label><input class="input" name="code" required value="<?= $pv('code') ?>"></div>
           <div class="field"><label>Name *</label><input class="input" name="name" required value="<?= $pv('name') ?>"></div>
-          
+
           <div class="field">
             <label>Region</label>
             <select class="input" name="region_id">
@@ -387,7 +407,7 @@ include __DIR__ . '/partials/header.php';
 <!-- Edit Modal -->
 <div id="modal-edit" class="modal" style="display:none">
   <div class="modal-backdrop" data-close="edit"></div>
-  <div class="modal-card" style="max-width:720px">
+  <div class="modal-card" style="max-width:760px">
     <div class="modal-h">
       <h3>Edit Location</h3>
       <button type="button" class="btn" data-close="edit">✕</button>
@@ -398,7 +418,7 @@ include __DIR__ . '/partials/header.php';
         <div class="form-grid">
           <div class="field"><label>Code *</label><input class="input" name="code" id="e_code" required></div>
           <div class="field"><label>Name *</label><input class="input" name="name" id="e_name" required></div>
-          
+
           <div class="field">
             <label>Region</label>
             <select class="input" name="region_id" id="e_region_id">
@@ -431,10 +451,8 @@ include __DIR__ . '/partials/header.php';
             <input type="checkbox" name="active" id="e_active">
             <label for="e_active">Active</label>
           </div>
-          
-          <?php foreach ($custom_fields as $cf): 
-            $key = 'custom_field['.(int)$cf['id'].']';
-          ?>
+
+          <?php foreach ($custom_fields as $cf): $key = 'custom_field['.(int)$cf['id'].']'; ?>
             <div class="field custom-field">
               <label><?= e($cf['name']) ?></label>
               <?php if ($cf['field_type'] === 'textarea'): ?>
@@ -457,10 +475,10 @@ include __DIR__ . '/partials/header.php';
   </div>
 </div>
 
-<!-- Manage Regions Modal -->
+<!-- Manage Regions -->
 <div id="modal-manage-regions" class="modal" style="display:none">
   <div class="modal-backdrop" data-close="manage-regions"></div>
-  <div class="modal-card" style="max-width:500px">
+  <div class="modal-card" style="max-width:520px">
     <div class="modal-h">
       <h3>Manage Regions</h3>
       <button type="button" class="btn" data-close="manage-regions">✕</button>
@@ -473,7 +491,7 @@ include __DIR__ . '/partials/header.php';
         <input type="hidden" name="add_region" value="1">
         <button class="btn btn-primary">Add</button>
       </form>
-      
+
       <h4>Existing Regions</h4>
       <table class="table">
         <thead><tr><th>Name</th><th style="width:100px">Actions</th></tr></thead>
@@ -496,10 +514,10 @@ include __DIR__ . '/partials/header.php';
   </div>
 </div>
 
-<!-- Manage Custom Fields Modal -->
+<!-- Manage Custom Fields -->
 <div id="modal-manage-fields" class="modal" style="display:none">
   <div class="modal-backdrop" data-close="manage-fields"></div>
-  <div class="modal-card" style="max-width:600px">
+  <div class="modal-card" style="max-width:640px">
     <div class="modal-h">
       <h3>Manage Custom Fields</h3>
       <button type="button" class="btn" data-close="manage-fields">✕</button>
@@ -524,7 +542,7 @@ include __DIR__ . '/partials/header.php';
         <input type="hidden" name="add_field" value="1">
         <button class="btn btn-primary">Add</button>
       </form>
-      
+
       <h4>Existing Custom Fields</h4>
       <table class="table">
         <thead><tr><th>Name</th><th>Key</th><th>Type</th><th style="width:100px">Actions</th></tr></thead>
@@ -565,20 +583,6 @@ include __DIR__ . '/partials/header.php';
 .loc-actions{ margin-top:.5rem; display:flex; justify-content:flex-end; }
 .btn-sm{ padding:.25rem .5rem; font-size:.85rem; }
 
-/* Modal system (framework-free) */
-.modal{ position:fixed; inset:0; display:none; z-index:2000; }
-.modal-open{ overflow:hidden; }
-.modal-backdrop{ position:absolute; inset:0; background:rgba(17,24,39,.55); }
-.modal-card{
-  position:relative; background:#fff; margin:6vh auto; width:min(720px, calc(100% - 32px));
-  max-height:88vh; overflow:auto; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,.15);
-  transform:translateY(10px); opacity:.98; transition:transform .15s ease, opacity .15s ease;
-}
-.modal.show .modal-card{ transform:translateY(0); opacity:1; }
-.modal-h,.modal-f{ padding:12px 16px; display:flex; justify-content:space-between; align-items:center; }
-.modal-h{ border-bottom:1px solid #e5e7eb; } .modal-f{ border-top:1px solid #e5e7eb; }
-.modal-b{ padding:16px; }
-
 /* Forms in modals */
 .form-grid{ display:grid; grid-template-columns:1fr 1fr; gap:1rem; }
 .field{ display:flex; flex-direction:column; gap:.35rem; }
@@ -589,106 +593,115 @@ include __DIR__ . '/partials/header.php';
 </style>
 
 <script>
-// Modal controller
+window.CUSTOM_FIELDS = <?= json_encode($custom_fields, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES) ?>;
+
+/* Polyfill openModal/closeModal if header doesn't provide them */
 (function(){
-  const body = document.body;
-  window.openModal = function(name){
-    const el = document.getElementById('modal-' + name);
-    if (!el) return;
-    el.style.display = 'block';
-    body.classList.add('modal-open');
-    requestAnimationFrame(()=> el.classList.add('show'));
-  };
-  window.closeModal = function(name){
-    const el = document.getElementById('modal-' + name);
-    if (!el) return;
-    el.classList.remove('show');
-    setTimeout(()=>{ el.style.display = 'none'; body.classList.remove('modal-open'); }, 150);
-  };
-  document.addEventListener('click', function(e){
-    const openBtn = e.target.closest && e.target.closest('[data-open]');
-    if (openBtn){ e.preventDefault(); openModal(openBtn.getAttribute('data-open')); return; }
-    const closeBtn = e.target.closest && e.target.closest('[data-close]');
-    if (closeBtn){ e.preventDefault(); closeModal(closeBtn.getAttribute('data-close')); return; }
-    if (e.target.classList && e.target.classList.contains('modal-backdrop')){
-      const name = e.target.getAttribute('data-close'); closeModal(name); return;
-    }
-  });
+  if (!window.openModal) {
+    window.openModal = function(name){
+      const id = name.startsWith('modal-') ? name : ('modal-' + name);
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'flex';
+    };
+  }
+  if (!window.closeModal) {
+    window.closeModal = function(name){
+      const id = name.startsWith('modal-') ? name : ('modal-' + name);
+      const el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    };
+    // data-open / data-close hooks
+    document.addEventListener('click', (ev)=>{
+      const open = ev.target.closest('[data-open]');
+      const close= ev.target.closest('[data-close]');
+      if (open){ ev.preventDefault(); window.openModal(open.getAttribute('data-open')); }
+      if (close){ ev.preventDefault(); window.closeModal(close.getAttribute('data-close')); }
+    }, {passive:false});
+  }
 })();
 
-// Data for modals
-window.ALL_LOCATIONS = <?php echo json_encode($locations, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES); ?>;
-window.CUSTOM_FIELDS  = <?php echo json_encode($custom_fields, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES); ?>;
-
-// Click card -> detail
+/* Location detail */
 function openLocationModal(l){
   const content = document.getElementById('ld_content');
-  const statusText = (l.active == 1) ? 'Active' : 'Inactive';
+  const isActive = (l.active == 1);
   let html = `
     <p><strong>Code:</strong> ${l.code||''}</p>
     <p><strong>Name:</strong> ${l.name||''}</p>
     ${l.region_name ? `<p><strong>Region:</strong> ${l.region_name}</p>` : ''}
     ${l.birthdate_disp ? `<p><strong>Birthdate:</strong> ${l.birthdate_disp}</p>` : ''}
-    ${l.address ? `<p><strong>Address:</strong> ${String(l.address).replace(/\\n/g,'<br>')}</p>` : ''}
+    ${l.address ? `<p><strong>Address:</strong> ${(l.address||'').replace(/\n/g,'<br>')}</p>` : ''}
     ${l.manager_name ? `<p><strong>Manager:</strong> ${l.manager_name} (${l.mgr_email || '—'})</p>` : ''}
     <p><strong>Phone:</strong> ${l.phone || '—'} ${l.phone_ext ? `(ext ${l.phone_ext})` : ''}</p>
     <p><strong>Email:</strong> ${l.email || '—'}</p>
-    <p><strong>Status:</strong> ${statusText}</p>
+    <p><strong>Status:</strong> ${isActive ? 'Active' : 'Inactive'}</p>
   `;
-  if (Array.isArray(window.CUSTOM_FIELDS) && window.CUSTOM_FIELDS.length){
+  if (window.CUSTOM_FIELDS.length > 0) {
     html += '<h4 style="margin-top:1rem;border-top:1px solid #eee;padding-top:.5rem;">Custom Details</h4>';
+    const map = l.custom_fields || {};
     window.CUSTOM_FIELDS.forEach(cf=>{
-      const val = (l.custom_fields && l.custom_fields[cf.id]) || '—';
-      html += `<p><strong>${cf.name}:</strong> ${val}</p>`;
+      const v = map[String(cf.id)] ?? map[cf.id] ?? '—';
+      html += `<p><strong>${cf.name}:</strong> ${v}</p>`;
     });
   }
   content.innerHTML = html;
   document.getElementById('ld_name').textContent = l.name || 'Location Detail';
-  openModal('location-detail');
+  window.openModal('location-detail');
 }
 
-// Edit button -> fill form -> open
+/* Edit modal — load enriched JSON from the hidden holder on each card */
+function setVal(id, v) { const el = document.getElementById(id); if (el) el.value = (v ?? ''); }
+function setChecked(id, on) { const el = document.getElementById(id); if (el) el.checked = !!on; }
+function safeDate(v){ return /^\d{4}-\d{2}-\d{2}$/.test((v||'')) ? v : ''; }
+
 function openEditModal(id){
-  const l = window.ALL_LOCATIONS.find(x => Number(x.id) === Number(id));
-  if (!l) return;
-  const safeDate = v => (/^\\d{4}-\\d{2}-\\d{2}$/).test(v||'') ? v : '';
+  try {
+    const holder = document.getElementById('locjson-'+id);
+    if (!holder) { console.warn('locjson holder missing for id', id); return; }
+    const l = JSON.parse(holder.dataset.json || '{}');
 
-  // clear previous custom values
-  document.querySelectorAll('#modal-edit [data-cf-id]').forEach(el=>{
-    if (el.type === 'checkbox') el.checked = false; else el.value = '';
-  });
+    // Clear previous CF values
+    document.querySelectorAll('#modal-edit [data-cf-id]').forEach(input => {
+      if (input.type === 'checkbox') input.checked = false;
+      else input.value = '';
+    });
 
-  const setVal = (id,val)=>{ const el=document.getElementById(id); if (el) el.value = (val??''); };
+    // Standard fields
+    setVal('e_id', l.id);
+    setVal('e_code', l.code);
+    setVal('e_name', l.name);
+    setVal('e_birth', safeDate(l.birthdate));
+    setVal('e_addr', l.address);
+    setVal('e_mgr', l.manager_user_id);
+    setVal('e_phone', l.phone);
+    setVal('e_phone_ext', l.phone_ext);
+    setVal('e_email', l.email);
+    setChecked('e_active', (l.active == 1));
 
-  setVal('e_id', l.id);
-  setVal('e_code', l.code);
-  setVal('e_name', l.name);
-  setVal('e_birth', safeDate(l.birthdate));
-  setVal('e_addr', l.address);
-  setVal('e_mgr', l.manager_user_id);
-  setVal('e_phone', l.phone);
-  setVal('e_phone_ext', l.phone_ext);
-  setVal('e_email', l.email);
-  const ac = document.getElementById('e_active'); if (ac) ac.checked = (l.active == 1);
-  setVal('e_region_id', l.region_id);
+    const regionSel = document.getElementById('e_region_id');
+    if (regionSel) regionSel.value = (l.region_id != null ? String(l.region_id) : '');
 
-  (window.CUSTOM_FIELDS||[]).forEach(cf=>{
-    const input = document.querySelector('#modal-edit [data-cf-id=\"'+cf.id+'\"]');
-    if (input){
-      const value = (l.custom_fields && l.custom_fields[cf.id]) || '';
-      if (input.tagName === 'TEXTAREA') input.value = value;
-      else if (input.type === 'checkbox') input.checked = (value == 1);
-      else input.value = value;
-    }
-  });
+    // Custom fields
+    const map = l.custom_fields || {};
+    window.CUSTOM_FIELDS.forEach(cf=>{
+      const el = document.querySelector(`#modal-edit [data-cf-id="${cf.id}"]`);
+      if (!el) return;
+      const v = map[String(cf.id)] ?? map[cf.id] ?? '';
+      if (el.tagName === 'TEXTAREA') el.value = v;
+      else if (el.type === 'checkbox') el.checked = (v == 1 || v === true);
+      else el.value = v;
+    });
 
-  openModal('edit');
+    window.openModal('edit');
+    console.debug('[locations] openEdit OK', id);
+  } catch (err) {
+    console.error('openEditModal fatal', err);
+  }
 }
 
-// Deep-link support
+// Deep link support after redirect (validation bounce)
 (function(){
-  if (location.hash === '#modal-create') openModal('create');
-  if (location.hash === '#modal-edit')   openModal('edit');
+  if (location.hash === '#modal-create') window.openModal('create');
+  if (location.hash === '#modal-edit') window.openModal('edit');
 })();
 </script>
 
